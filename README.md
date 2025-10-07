@@ -14,7 +14,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] MSE loss
     - [x] Training loop
     - [x] LPIPS loss
-    - [ ] checkpointing
+    - [x] checkpointing
     - [ ] Smaller tweaks
         - [ ] RoPE
         - [ ] SwiGLU

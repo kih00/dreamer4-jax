@@ -7,6 +7,53 @@ from tokenizer import Encoder, Decoder
 from data import make_iterator, patchify, unpatchify
 import imageio
 from jaxlpips import LPIPS
+from pathlib import Path
+import orbax.checkpoint as ocp
+
+# -------- Checkpoint helpers --------
+def make_state(params, opt_state, rng, step):
+    # Pack training state as a PyTree; JAX/Orbax-friendly types only.
+    return {
+        "params": params,
+        "opt_state": opt_state,
+        "rng": rng,
+        "step": jnp.int32(step),
+    }
+
+def make_manager(ckpt_dir: str, max_to_keep: int = 5, save_interval_steps: int = 1000, item_names=("state","meta")):
+    path = Path(ckpt_dir).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    options = ocp.CheckpointManagerOptions(max_to_keep=max_to_keep,
+                                           save_interval_steps=save_interval_steps)
+    # item_names gives nice attribute access on restore: restored.state, restored.meta
+    mngr = ocp.CheckpointManager(path, options=options, item_names=item_names)
+    return mngr
+
+def try_restore(mngr: ocp.CheckpointManager, state_example: dict, meta_example: dict | None = None):
+    """
+    Build abstract trees from current shapes/dtypes so Orbax can restore safely
+    (StandardRestore wants an abstract tree). :contentReference[oaicite:3]{index=3}
+    """
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)   # :contentReference[oaicite:4]{index=4}
+    restore_args = ocp.args.Composite(
+        state=ocp.args.StandardRestore(abstract_state),                                      # :contentReference[oaicite:5]{index=5}
+        meta=ocp.args.JsonRestore() if meta_example is not None else None
+    )
+    latest = mngr.latest_step()
+    if latest is None:
+        return None
+    restored = mngr.restore(latest, args=restore_args)
+    return latest, restored
+
+def maybe_save(mngr: ocp.CheckpointManager, step: int, state: dict, meta: dict | None = None):
+    if not mngr.should_save(step):  # obey save interval policy
+        return
+    save_args = ocp.args.Composite(
+        state=ocp.args.StandardSave(state),
+        meta=ocp.args.JsonSave(meta) if meta is not None else None
+    )
+    mngr.save(step, args=save_args)  # async by default; runs in a background thread. :contentReference[oaicite:6]{index=6}
+
 
 # --- helpers ---
 temporal_patchify = jax.jit(
@@ -199,10 +246,17 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     new_enc_vars, new_dec_vars = unpack_params(new_params, enc_vars, dec_vars)
     return new_params, opt_state, new_enc_vars, new_dec_vars, aux
 
-# --- usage example ---
 if __name__ == "__main__":
+
+    log_dir = Path("./logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_name = "test"
+    run_dir = log_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+
     rng = jax.random.PRNGKey(0)
-    B, T, H, W, C, square_size = 64, 8, 64, 64, 3, 8
+    B, T, H, W, C, square_size = 2, 8, 64, 64, 3, 8
     patch = 4
     num_patches = (H // patch) * (W // patch)
     D_patch = patch * patch * C
@@ -212,32 +266,20 @@ if __name__ == "__main__":
     rng, batch_rng = jax.random.split(rng)
     rng, first_batch = next_batch(rng)  # warmup
 
-    # 1) Fix a tiny viz batch once
+    # tiny fixed viz batch
     viz_rng = jax.random.PRNGKey(0)
-    _, viz_batch = next_batch(viz_rng)   # shape (B,T,H,W,C)
-    viz_batch = viz_batch[:8, :1]        # just (8,1,H,W,C) to keep it tiny
-
+    _, viz_batch = next_batch(viz_rng)
+    viz_batch = viz_batch[:8, :1]
 
     # models
     enc_n_latents, enc_d_bottleneck = 2, 16
-    # encoder, decoder = make_models(num_patches, D_patch, enc_n_latents, enc_d_bottleneck)
     enc_kwargs = {
-        "d_model": 32,
-        "n_latents": enc_n_latents,
-        "n_heads": 8,
-        "depth": 8,
-        "dropout": 0.3,
-        "d_bottleneck": enc_d_bottleneck,
-        "mae_p_min": 0.0,
-        "mae_p_max": 0.9,
+        "d_model": 32, "n_latents": enc_n_latents, "n_heads": 8, "depth": 8, "dropout": 0.3,
+        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.9,
     }
     dec_kwargs = {
-        "d_model": 32,
-        "n_heads": 8,
-        "n_patches": num_patches,
-        "depth": 8,
-        "d_patch": D_patch,
-        "dropout": 0.3,
+        "d_model": 32, "n_heads": 8, "n_patches": num_patches, "depth": 8,
+        "d_patch": D_patch, "dropout": 0.3,
     }
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
@@ -250,33 +292,64 @@ if __name__ == "__main__":
     tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
 
-    # train loop
-    for step in range(100000):
-        # for now, fix rng to a single seed to debug.
-        # data_rng = jax.random.PRNGKey(0)
-        # _, batch = next_batch(data_rng)
-        rng, batch = next_batch(rng)
-        rng, master_key = jax.random.split(rng)
-        params, opt_state, enc_vars, dec_vars, aux = train_step(
-            encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-            patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=0.2, lpips_frac=0.5
-        )
-        mse_loss = float(aux['loss_mse'])
-        rmse_loss = jnp.sqrt(mse_loss)
-        lpips_loss = float(aux['loss_lpips'])
-        total_loss = float(aux['loss_total'])
-        if step % 100 == 0:
-            print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f}")
-        if step % 10000 == 0:
-            rng, viz_key = jax.random.split(rng)
-            mae_key, drop_key = jax.random.split(viz_key)
-            out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
-                        patch=patch, mae_key=mae_key, drop_key=drop_key)
+    # ---------- ORBAX: manager + (optional) restore ----------
+    ckpt_dir = run_dir / "checkpoints"
+    mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=1_000)
 
-            target = jnp.concatenate(temporal_unpatchify(out["target"], H, W, C, patch).squeeze(), axis=1)
-            masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], H, W, C, patch).squeeze(), axis=1)
-            rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], H, W, C, patch).squeeze(), axis=1)
-            rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze(), axis=1)
-            grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
-            grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
-            imageio.imwrite(f"step_{step:03d}.png", grid)
+    # Build example trees for safe restore (use live shapes/dtypes).
+    state_example = make_state(params, opt_state, rng, step=0)
+    meta_example = {"enc_kwargs": enc_kwargs, "dec_kwargs": dec_kwargs,
+                    "H": H, "W": W, "C": C, "patch": patch}
+
+    restored = try_restore(mngr, state_example, meta_example)
+    start_step = 0
+    if restored is not None:
+        latest_step, r = restored
+        # Unpack state back to your locals
+        params = r.state["params"]
+        opt_state = r.state["opt_state"]
+        rng = r.state["rng"]
+        start_step = int(r.state["step"])
+        # Optional: you can read r.meta here if you want to sanity-check config.
+
+        # Rebuild enc_vars/dec_vars from params so downstream apply() uses the restored params.
+        enc_vars, dec_vars = unpack_params(params, enc_vars, dec_vars)
+        print(f"Restored checkpoint at step {latest_step} from {ckpt_dir}")
+
+    # ---------- Train loop ----------
+    try:
+        for step in range(start_step, 3000):
+            rng, batch = next_batch(rng)
+            rng, master_key = jax.random.split(rng)
+            params, opt_state, enc_vars, dec_vars, aux = train_step(
+                encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
+                patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=0.2, lpips_frac=0.5
+            )
+
+            # Log
+            if step % 100 == 0:
+                mse_loss = float(aux['loss_mse'])
+                lpips_loss = float(aux['loss_lpips'])
+                total_loss = float(aux['loss_total'])
+                print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f}")
+
+            # Save (async)
+            state = make_state(params, opt_state, rng, step)
+            maybe_save(mngr, step, state, meta_example)
+
+            # Viz
+            if step % 10000 == 0:
+                rng, viz_key = jax.random.split(rng)
+                mae_key, drop_key = jax.random.split(viz_key)
+                out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
+                               patch=patch, mae_key=mae_key, drop_key=drop_key)
+                target = jnp.concatenate(temporal_unpatchify(out["target"], H, W, C, patch).squeeze(), axis=1)
+                masked_in = jnp.concatenate(temporal_unpatchify(out["masked_input"], H, W, C, patch).squeeze(), axis=1)
+                rec_masked  = jnp.concatenate(temporal_unpatchify(out["recon_masked"], H, W, C, patch).squeeze(), axis=1)
+                rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze(), axis=1)
+                grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
+                grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
+                imageio.imwrite(f"step_{step:03d}.png", grid)
+    finally:
+        # Make sure any background saves finish before exit. :contentReference[oaicite:7]{index=7}
+        mngr.wait_until_finished()
