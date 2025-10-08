@@ -9,6 +9,7 @@ import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 import orbax.checkpoint as ocp
+from time import time
 
 # -------- Checkpoint helpers --------
 def make_state(params, opt_state, rng, step):
@@ -115,10 +116,10 @@ def recon_loss_from_mae(pred_btnd, patches_btnd, mae_mask):
     masked_pred   = jnp.where(mae_mask, pred_btnd, 0.0)
     masked_target = jnp.where(mae_mask, patches_btnd, 0.0)
     num = jnp.maximum(mae_mask.sum(), 1)
-    return jnp.sum((masked_pred - masked_target) ** 2) / num
+    return jnp.sum((masked_pred - masked_target) ** 2) / (num * pred_btnd.shape[-1])
 
 # --- instantiate once (top-level / main) ---
-lpips_loss_fn = LPIPS(pretrained_network="alexnet")  # or "vgg", "squeeze"
+lpips_loss_fn = None
 
 def lpips_on_mae_recon(
     pred, target, mae_mask, *, H, W, C, patch,
@@ -222,11 +223,16 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
         mse = recon_loss_from_mae(pred, patches_btnd, mae_mask)
 
         # LPIPS on recon_masked vs target (unpatchified frames)
-        lpips = lpips_on_mae_recon(
-            pred, patches_btnd, mae_mask,
-            H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
-        )
-        total = mse + lpips_weight * lpips
+        if lpips_weight > 0.0:
+            lpips = lpips_on_mae_recon(
+                pred, patches_btnd, mae_mask,
+                H=H, W=W, C=C, patch=patch, subsample_frac=lpips_frac
+            )
+            total = mse + lpips_weight * lpips
+        else:
+            lpips = 0.0
+            total = mse
+
         aux = {
             "loss_total": total,
             "loss_mse": mse,
@@ -256,30 +262,31 @@ if __name__ == "__main__":
 
 
     rng = jax.random.PRNGKey(0)
-    B, T, H, W, C, square_size = 2, 8, 64, 64, 3, 8
+    B, T, H, W, C, size_range = 64, 4, 32, 32, 3, (8, 24)
     patch = 4
     num_patches = (H // patch) * (W // patch)
     D_patch = patch * patch * C
 
+    # losses and optimization
+    lpips_weight = 0.2
+    if lpips_weight > 0.0:
+        lpips_loss_fn = LPIPS(pretrained_network="alexnet")  # or "vgg", "squeeze"
+    lpips_frac = 0.5
+
     # data
-    next_batch = make_iterator(B, T, H, W, C, square_size)
+    next_batch = make_iterator(B, T, H, W, C, size_range)
     rng, batch_rng = jax.random.split(rng)
     rng, first_batch = next_batch(rng)  # warmup
 
-    # tiny fixed viz batch
-    viz_rng = jax.random.PRNGKey(0)
-    _, viz_batch = next_batch(viz_rng)
-    viz_batch = viz_batch[:8, :1]
-
     # models
-    enc_n_latents, enc_d_bottleneck = 2, 16
+    enc_n_latents, enc_d_bottleneck = 16, 32
     enc_kwargs = {
-        "d_model": 32, "n_latents": enc_n_latents, "n_heads": 8, "depth": 8, "dropout": 0.3,
-        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.9,
+        "d_model": 64, "n_latents": enc_n_latents, "n_heads": 4, "depth": 8, "dropout": 0.0,
+        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.1, "mae_p_max": 0.1, "time_every": 4,
     }
     dec_kwargs = {
-        "d_model": 32, "n_heads": 8, "n_patches": num_patches, "depth": 8,
-        "d_patch": D_patch, "dropout": 0.3,
+        "d_model": 64, "n_heads": 4, "n_patches": num_patches, "depth": 8,
+        "d_patch": D_patch, "dropout": 0.0, "time_every": 4,
     }
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
@@ -291,10 +298,11 @@ if __name__ == "__main__":
     params = pack_params(enc_vars, dec_vars)
     tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
+    max_steps = 100_000
 
     # ---------- ORBAX: manager + (optional) restore ----------
     ckpt_dir = run_dir / "checkpoints"
-    mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=1_000)
+    mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=10_000)
 
     # Build example trees for safe restore (use live shapes/dtypes).
     state_example = make_state(params, opt_state, rng, step=0)
@@ -318,29 +326,39 @@ if __name__ == "__main__":
 
     # ---------- Train loop ----------
     try:
-        for step in range(start_step, 3000):
+        for step in range(start_step, max_steps):
+            # use a fixed batch for debugging
+            # _, batch = next_batch(jax.random.PRNGKey(0))
+            data_start_t = time()
             rng, batch = next_batch(rng)
+            data_t = time() - data_start_t
+            train_start_t = time()
             rng, master_key = jax.random.split(rng)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batch,
-                patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=0.2, lpips_frac=0.5
+                patch=patch, H=H, W=W, C=C, master_key=master_key, step=step, lpips_weight=lpips_weight, lpips_frac=lpips_frac,
             )
+            train_t = time() - train_start_t
 
             # Log
             if step % 100 == 0:
                 mse_loss = float(aux['loss_mse'])
                 lpips_loss = float(aux['loss_lpips'])
                 total_loss = float(aux['loss_total'])
-                print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f}")
+                psnr = 10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10))
+                total_t = data_t + train_t
+                print(f"step {step:03d} |  total={total_loss:.6f} | rmse={jnp.sqrt(mse_loss):.6f} | lpips={lpips_loss:.4f} | psnr={psnr:.4f} | time={total_t:.3f}s")
 
             # Save (async)
             state = make_state(params, opt_state, rng, step)
             maybe_save(mngr, step, state, meta_example)
 
             # Viz
-            if step % 10000 == 0:
+            if step % 1000 == 0:
                 rng, viz_key = jax.random.split(rng)
-                mae_key, drop_key = jax.random.split(viz_key)
+                mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
+                _, viz_batch = next_batch(vis_batch_key)
+                viz_batch = viz_batch[:8, :1]
                 out = viz_step(encoder, decoder, enc_vars, dec_vars, viz_batch,
                                patch=patch, mae_key=mae_key, drop_key=drop_key)
                 target = jnp.concatenate(temporal_unpatchify(out["target"], H, W, C, patch).squeeze(), axis=1)
@@ -349,7 +367,7 @@ if __name__ == "__main__":
                 rec_unmasked  = jnp.concatenate(temporal_unpatchify(out["recon_full"], H, W, C, patch).squeeze(), axis=1)
                 grid = jnp.concatenate([target, masked_in, rec_masked, rec_unmasked])
                 grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
-                imageio.imwrite(f"step_{step:03d}.png", grid)
+                imageio.imwrite(run_dir / f"step_{step:03d}.png", grid)
     finally:
-        # Make sure any background saves finish before exit. :contentReference[oaicite:7]{index=7}
+        # Make sure any background saves finish before exit.
         mngr.wait_until_finished()

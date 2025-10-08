@@ -15,6 +15,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] Training loop
     - [x] LPIPS loss
     - [x] checkpointing
+    - [ ] wandb logging
     - [ ] Smaller tweaks
         - [ ] RoPE
         - [ ] SwiGLU
@@ -37,14 +38,14 @@ By default, this installs the CPU version of jax. Follow the instructions in the
 
 For now, we are generating bouncing square dataset in `data.py`. It outputs a (B,T,H,W,C) batch of data. We eventually need to add in actions and rewards for the dynamics model and RL training. 
 
-<img src="docs/video.gif" width="300px">
+<img src="docs/video.gif" width="500px">
  
 ## Causal Tokenizer
-The Causal Tokenizer learns the representation for Dreamer 4. I've done a very preliminary sanity check by overfitting it on one video with MSE and seeing if we can reconstruct it. 
+The Causal Tokenizer learns the representation for Dreamer 4.
 
-<img src="docs/step_90000.png" width="300px">
+<img src="docs/step_75900.png" width="300px">
 
-From left to right we have: 2 images, their masked variants that are fed to the encoder, then 4 decoder outputs (2 partial decodings, and 2 full decodings). We can see the decoder outputs match the input images well.  
+From top to bottom we have: 2 images, their masked variants that are fed to the encoder, then 4 decoder outputs (2 partial decodings, and 2 full decodings). We can see the decoder outputs match the input images well.  
 
 It is a causal transformer encoder, trained through a masked autoencoder loss. Dreamer 4 uses an efficient transformer design which uses axial attention to attend to the space and time dimensions independently. 
 
