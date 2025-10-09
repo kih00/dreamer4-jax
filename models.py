@@ -3,15 +3,50 @@ import flax.linen as nn
 import jax
 import time
 from flax.core import FrozenDict
+import flax
+from enum import IntEnum
+from typing import Tuple
 
-"""
-- prelayer RMS norm
+class Modality(IntEnum):
+    LATENT   = -1
+    IMAGE    = 0
+    ACTION   = 1
+    PROPRIO  = 2
+    REGISTER = 3
 
-Skipped:
-- RoPE, using sinusoidal positions instead
-- SwiGLU, using GELU instead
-- GQA
-"""
+    # add more as needed
+
+@flax.struct.dataclass  # immutable, PyTree-friendly
+class TokenLayout:
+    """
+    Ordered token layout for a single timestep: latents first (if any),
+    then a sequence of (modality, count) segments.
+    """
+    n_latents: int
+    segments: Tuple[Tuple[Modality, int], ...]  # e.g., ((Modality.IMAGE, n_patches), (Modality.ACTION, n_act), ...)
+
+    def S(self) -> int:
+        return self.n_latents + sum(n for _, n in self.segments)
+
+    def modality_ids(self) -> jnp.ndarray:
+        parts = [jnp.full((self.n_latents,), Modality.LATENT, dtype=jnp.int32)] if self.n_latents > 0 else []
+        for m, n in self.segments:
+            if n > 0:
+                parts.append(jnp.full((n,), int(m), dtype=jnp.int32))
+        return jnp.concatenate(parts) if parts else jnp.zeros((0,), dtype=jnp.int32)  # (S,)
+
+    def slices(self) -> dict:
+        """Convenience: start/stop indices per modality (first occurrence if repeated)."""
+        idx = 0
+        out = {}
+        if self.n_latents > 0:
+            out[Modality.LATENT] = slice(idx, idx + self.n_latents); idx += self.n_latents
+        for m, n in self.segments:
+            if n > 0 and m not in out:
+                out[m] = slice(idx, idx + n)
+            idx += n
+        return out
+
     
 def sinusoid_table(n: int, d: int, base: float = 10000.0, dtype=jnp.float32) -> jnp.ndarray:
     """
@@ -276,10 +311,8 @@ class Encoder(nn.Module):
     def setup(self):
         self.patch_proj = nn.Dense(self.d_model, name="patch_proj")
         self.bottleneck_proj = nn.Dense(self.d_bottleneck, name="bottleneck_proj")
-        self.modality_ids = jnp.concatenate([
-            jnp.full((self.n_latents,), -1, dtype=jnp.int32),
-            jnp.zeros((self.n_patches,), dtype=jnp.int32),
-        ], axis=0)
+        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
+        self.modality_ids = self.layout.modality_ids()            # (S,)
         self.transformer = BlockCausalTransformer(
             d_model=self.d_model,
             n_heads=self.n_heads,
@@ -350,10 +383,8 @@ class Decoder(nn.Module):
     latents_only_time: bool = True
 
     def setup(self):
-        self.modality_ids = jnp.concatenate([
-            jnp.full((self.n_latents,), -1, dtype=jnp.int32),
-            jnp.zeros((self.n_patches,), dtype=jnp.int32),
-        ], axis=0)
+        self.layout = TokenLayout(n_latents=self.n_latents, segments=((Modality.IMAGE, self.n_patches),))
+        self.modality_ids = self.layout.modality_ids()
         self.up_proj = nn.Dense(self.d_model, name="up_proj")
         self.patch_queries = self.param(
             "patch_queries",
@@ -402,8 +433,7 @@ class Decoder(nn.Module):
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
         return pred_btnd
 
-
-if __name__ == "__main__":
+def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)
     B = 2
     T = 10
@@ -473,3 +503,6 @@ if __name__ == "__main__":
     # recon_loss = jnp.sum((masked_pred - masked_target) ** 2) / num_masked
     # print(recon_loss)
     # import ipdb; ipdb.set_trace()
+
+if __name__ == "__main__":
+    test_encoder_decoder()
