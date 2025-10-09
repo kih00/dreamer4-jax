@@ -262,7 +262,14 @@ if __name__ == "__main__":
 
 
     rng = jax.random.PRNGKey(0)
-    B, T, H, W, C, size_range = 64, 4, 32, 32, 3, (8, 24)
+    # dataset parameters
+    B, T, H, W, C = 64, 4, 32, 32, 3
+    pixels_per_step = 2 # how many pixels the agent moves per step
+    size_min = 6 # minimum size of the square
+    size_max = 14 # maximum size of the square
+    hold_min = 4 # how long the agent holds a direction for
+    hold_max = 9 # how long the agent holds a direction for
+
     patch = 4
     num_patches = (H // patch) * (W // patch)
     D_patch = patch * patch * C
@@ -274,7 +281,11 @@ if __name__ == "__main__":
     lpips_frac = 0.5
 
     # data
-    next_batch = make_iterator(B, T, H, W, C, size_range)
+    _next_batch = make_iterator(B, T, H, W, C, pixels_per_step, size_min, size_max, hold_min, hold_max)
+    def next_batch(rng):
+        rng, (videos, actions) = _next_batch(rng)
+        return rng, videos
+
     rng, batch_rng = jax.random.split(rng)
     rng, first_batch = next_batch(rng)  # warmup
 
@@ -298,7 +309,7 @@ if __name__ == "__main__":
     params = pack_params(enc_vars, dec_vars)
     tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
-    max_steps = 100_000
+    max_steps = 1_000_000
 
     # ---------- ORBAX: manager + (optional) restore ----------
     ckpt_dir = run_dir / "checkpoints"
@@ -354,7 +365,7 @@ if __name__ == "__main__":
             maybe_save(mngr, step, state, meta_example)
 
             # Viz
-            if step % 1000 == 0:
+            if step % 10000 == 0:
                 rng, viz_key = jax.random.split(rng)
                 mae_key, drop_key, vis_batch_key = jax.random.split(viz_key, 3)
                 _, viz_batch = next_batch(vis_batch_key)
