@@ -517,7 +517,9 @@ class ActionEncoder(nn.Module):
 
 class Dynamics(nn.Module):
     d_model: int              # dimensionality of each token
-    n_s: int                  # number of spatial tokens after packing
+    d_bottleneck: int         # dimensionality of the input bottleneck space
+    d_spatial: int            # dimensionality of each spatial token input
+    n_s: int                  # number of spatial tokens
     n_r: int                  # number of learned register tokens
     n_heads: int
     depth: int
@@ -528,7 +530,11 @@ class Dynamics(nn.Module):
     latents_only_time: bool = False
 
     def setup(self):
-        self.enc_z_proj = nn.Dense(self.d_model, name="enc_z_proj")  # (unused in your reshape path; keep if needed)
+        # Want to transform bottleneck inputs (B, T, N_b, D_b) to (B, T, N_b/packing_factor, D_b*packing_factor)
+        assert self.d_spatial % self.d_bottleneck == 0
+        self.packing_factor = self.d_spatial // self.d_bottleneck
+
+        self.spatial_proj = nn.Dense(self.d_model, name="proj_spatial") # converts spatial tokens, of dim d_spatial to d_model
         self.register_tokens = self.param(
             "register_tokens",
             nn.initializers.normal(0.02),
@@ -570,8 +576,7 @@ class Dynamics(nn.Module):
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         # Indexing: signal_idx = τ / d ∈ {0, 1, ..., (1/d) - 1}
         self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
-        self.flow_x_head = nn.Dense(self.d_model, name="flow_x_head")
-
+        self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head")
 
     @nn.compact
     def __call__(self, enc_z, actions, signal_idx, step_idx, *, deterministic: bool = True):
@@ -591,12 +596,10 @@ class Dynamics(nn.Module):
           step_token:     (B, T, 1, d_model)
         """
         # --- 1) Pack encoder tokens: (B, T, 512, 16) -> (B, T, 256, 32) as example
-        spatial_tokens = rearrange(
-            enc_z, 'b t (n_s k) d -> b t n_s (k d)', k=2, n_s=self.n_s
+        packed_enc_tokens = rearrange(
+            enc_z, 'b t (n_s k) d -> b t n_s (k d)', k=self.packing_factor, n_s=self.n_s
         )
-        # Optionally project to d_model if needed (e.g., when feature dim != d_model)
-        if spatial_tokens.shape[-1] != self.d_model:
-            spatial_tokens = self.enc_z_proj(spatial_tokens)
+        spatial_tokens = self.spatial_proj(packed_enc_tokens) # (B, T, n_s, d_model)
 
         # --- 2) Encode actions to d_model
         action_tokens = self.action_encoder(actions)  # (B, T, N_a, d_model)
@@ -705,7 +708,18 @@ def test_dynamics():
     fake_signal_idx = jnp.ones((B, T), dtype=jnp.int32)
     fake_step_idx = jnp.ones((B, T), dtype=jnp.int32)
     # need some way to assert that 512 * 16 == 256 * 32
-    dynamics = Dynamics(k_max=8, n_s=256, d_model=32, n_r=10, n_heads=4, depth=4, dropout=0.0)
+    dynamics_kwargs = {
+        "d_model": 128,
+        "n_s": 256,
+        "d_spatial": 32,
+        "d_bottleneck": 16,
+        "k_max": 8,
+        "n_r": 10,
+        "n_heads": 4,
+        "depth": 4,
+        "dropout": 0.0
+    }
+    dynamics = Dynamics(**dynamics_kwargs)
     dynamics_vars = dynamics.init(
         {"params": rng, "dropout": jax.random.PRNGKey(2)},
         fake_enc_z,
@@ -713,10 +727,9 @@ def test_dynamics():
         fake_signal_idx,
         fake_step_idx,
     )
-    out = dynamics.apply(dynamics_vars, fake_enc_z, fake_actions,
+    out = dynamics.apply(dynamics_vars, fake_enc_z, fake_actions, fake_signal_idx, fake_step_idx,
                         rngs={"dropout": jax.random.PRNGKey(2)},
                         deterministic=True)
-    import ipdb; ipdb.set_trace()
 if __name__ == "__main__":  
     # test_encoder_decoder()
     test_dynamics()

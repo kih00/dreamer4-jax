@@ -8,7 +8,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
 ## Roadmap
 
 - [x] Toy Video Dataset generation
-- [ ] Causal Tokenizer
+- [x] Causal Tokenizer
     - [x] Space-time Axial Attention
     - [x] MAE encoder decoder 
     - [x] MSE loss
@@ -25,8 +25,10 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] Add actions to Toy Video Dataset
     - [x] Add multi-modality support for efficient transformer block
     - [x] setup architecture
-        - [ ] need to generalize tokenizer preprocessing logic
-    - [ ] shortcut forcing 
+        - [x] need to generalize tokenizer preprocessing logic
+    - [ ] training loop
+        - [ ] data loading, need to import an encoder and forward the data.
+        - [ ] shortcut loss function 
 - [ ] Imagination training 
     - [ ] Behavior cloning and reward model
     - [ ] RL Training
