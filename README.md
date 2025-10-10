@@ -19,12 +19,13 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
         - [ ] wandb logging
         - [ ] cli args / config 
         - [ ] RoPE
-        - [ ] SwiGLU
+        - [x] SwiGLU
         - [ ] GQA
 - [ ] Interactive Dynamics Model
     - [x] Add actions to Toy Video Dataset
     - [x] Add multi-modality support for efficient transformer block
-    - [ ] setup architecture
+    - [x] setup architecture
+        - [ ] need to generalize tokenizer preprocessing logic
     - [ ] shortcut forcing 
 - [ ] Imagination training 
     - [ ] Behavior cloning and reward model

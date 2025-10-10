@@ -5,7 +5,8 @@ import time
 from flax.core import FrozenDict
 import flax
 from enum import IntEnum
-from typing import Tuple
+from typing import Optional, Tuple, Any
+from einops import rearrange
 
 class Modality(IntEnum):
     LATENT   = -1
@@ -13,6 +14,9 @@ class Modality(IntEnum):
     ACTION   = 1
     PROPRIO  = 2
     REGISTER = 3
+    SPATIAL = 4
+    SHORTCUT_SIGNAL = 5
+    SHORTCUT_STEP = 6
 
     # add more as needed
 
@@ -104,17 +108,60 @@ class RMSNorm(nn.Module):
         return x * (scale / jnp.sqrt(var + self.eps))
 
 class MLP(nn.Module):
+    """
+    Transformer MLP with optional SwiGLU gating.
+
+    Args:
+      d_model:     input/output width of the block (last-dim of x).
+      mlp_ratio:   expansion factor for hidden size if NOT using 2/3 parity.
+      dropout:     dropout rate applied after activation and after output proj.
+      swiglu:      if True, use SwiGLU; else standard GELU MLP.
+      parity_2over3:
+                   if True and swiglu=True, set hidden = (2/3)*mlp_ratio*d_model
+                   to roughly match parameter count of a GELU MLP with mlp_ratio.
+      dtype:       param/compute dtype.
+    """
     d_model: int
     mlp_ratio: float = 4.0
     dropout: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: Any = jnp.float32
+
     @nn.compact
-    def __call__(self, x, *, deterministic: bool):
-        h = nn.Dense(int(self.d_model * self.mlp_ratio))(x)
-        h = nn.gelu(h)
+    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        """
+        Args:
+          x:            (..., d_model) input activations.
+          deterministic:
+                        True disables dropout (eval); False enables dropout (train).
+
+        Returns:
+          y:            (..., d_model) output activations, same shape as input.
+        """
+        # Choose hidden size
+        mult = self.mlp_ratio
+        if self.swiglu and self.parity_2over3:
+            mult = self.mlp_ratio * (2.0 / 3.0)  # param parity with GELU MLP
+
+        hidden = int(self.d_model * mult)
+
+        if self.swiglu:
+            # SwiGLU: Dense -> split -> u * silu(v)
+            pre = nn.Dense(
+                2 * hidden, dtype=self.dtype, name="fc_in"
+            )(x)  # (..., 2H)
+            u, v = jnp.split(pre, 2, axis=-1)     # (..., H), (..., H)
+            h = u * jax.nn.silu(v)                # (..., H)
+        else:
+            # Standard GELU MLP
+            h = nn.Dense(hidden, dtype=self.dtype, name="fc_in")(x)
+            h = nn.gelu(h)
+
         h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
-        h = nn.Dense(self.d_model)(h)
-        h = nn.Dropout(self.dropout)(h, deterministic=deterministic)
-        return h
+        y = nn.Dense(self.d_model, dtype=self.dtype, name="fc_out")(h)
+        y = nn.Dropout(self.dropout)(y, deterministic=deterministic)
+        return y
 # ---------- axial attention layers ----------
 class SpaceSelfAttentionModality(nn.Module):
     """
@@ -163,6 +210,9 @@ class SpaceSelfAttentionModality(nn.Module):
             allow_lat_q = is_k_lat                                  # lat q -> lat k only
             allow_nonlat_q = jnp.logical_or(same_mod, is_k_lat)     # non-lat q -> same mod + latents
             mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
+        elif self.mode == "dynamics":
+            # allow full attention
+            mask = jnp.ones((S, S), dtype=bool)
         else:
             raise ValueError(f"Unknown mode {self.mode}")
 
@@ -433,6 +483,148 @@ class Decoder(nn.Module):
         pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
         return pred_btnd
 
+class ActionEncoder(nn.Module):
+    d_model: int
+    n_keyboard: int = 4  # up, down, left, right (categorical actions)
+
+    @nn.compact
+    def __call__(
+        self,
+        actions: Optional[jnp.ndarray],           # (B, T) int32 in [0, n_keyboard)
+        batch_time_shape: Optional[Tuple[int,int]] = None,
+        as_tokens: bool = True,
+    ):
+        # Base "action token" embedding (used always)
+        base_emb = self.param(
+            'base_action_emb', nn.initializers.normal(0.02), (self.d_model,)
+        )
+
+        if actions is None:
+            # unlabeled videos: just broadcast base embedding
+            assert batch_time_shape is not None
+            B, T = batch_time_shape
+            out = jnp.broadcast_to(base_emb, (B, T, self.d_model))
+        else:
+            # embed categorical actions
+            emb_key = nn.Embed(self.n_keyboard, self.d_model, name="emb_key")(actions)
+            out = emb_key + base_emb  # broadcast add
+
+        if as_tokens:
+            # expand a token axis (S_a = 1)
+            out = out[:, :, None, :]
+
+        return out
+
+class Dynamics(nn.Module):
+    d_model: int              # dimensionality of each token
+    n_s: int                  # number of spatial tokens after packing
+    n_r: int                  # number of learned register tokens
+    n_heads: int
+    depth: int
+    k_max: int                 # maximum number of sampling steps (defines finest step 1/)
+    dropout: float = 0.0
+    mlp_ratio: float = 4.0
+    time_every: int = 4
+    latents_only_time: bool = False
+
+    def setup(self):
+        self.enc_z_proj = nn.Dense(self.d_model, name="enc_z_proj")  # (unused in your reshape path; keep if needed)
+        self.register_tokens = self.param(
+            "register_tokens",
+            nn.initializers.normal(0.02),
+            (self.n_r, self.d_model),
+        )
+        self.action_encoder = ActionEncoder(d_model=self.d_model)
+
+        # Two separate tokens for shortcut conditioning (your current layout):
+        self.layout = TokenLayout(n_latents=0, segments=(
+                (Modality.ACTION, 1),
+                (Modality.SHORTCUT_SIGNAL, 1),   # τ (signal level) token
+                (Modality.SHORTCUT_STEP, 1),     # d (step size) token
+                (Modality.SPATIAL, self.n_s),
+                (Modality.REGISTER, self.n_r),
+            )
+        )
+        self.spatial_slice = self.layout.slices()[Modality.SPATIAL]
+        self.modality_ids = self.layout.modality_ids()
+
+        self.transformer = BlockCausalTransformer(
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            depth=self.depth,
+            n_latents=0,
+            modality_ids=self.modality_ids,
+            space_mode="dynamics",
+            dropout=self.dropout,
+            mlp_ratio=self.mlp_ratio,
+            latents_only_time=False,
+        )
+
+        # -------- Discrete embeddings for shortcut conditioning --------
+        # Step size d ∈ {1, 1/2, 1/4, ..., 1/}
+        # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2()}
+        self.num_step_bins = int(jnp.log2(self.k_max)) + 1
+        self.step_embed = nn.Embed(self.num_step_bins, self.d_model, name="step_embed")
+
+        # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
+        # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
+        # Indexing: signal_idx = τ / d ∈ {0, 1, ..., (1/d) - 1}
+        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
+        self.flow_x_head = nn.Dense(self.d_model, name="flow_x_head")
+
+
+    @nn.compact
+    def __call__(self, enc_z, actions, signal_idx, step_idx, *, deterministic: bool = True):
+        """
+        Args:
+          enc_z:      (B, T, N_l, D_b) encoder outputs before packing (e.g., 512×16)
+          actions:    (B, T, N_a, D_a) raw action tokens
+          signal_idx: (B, T) int32 — τ index on the grid for the chosen step size:
+                        signal_idx = τ / d, ∈ {0, 1, ..., 1/d - 1}
+          step_idx:   (B, T) int32 — step size index:
+                        step_idx = log2(1/d), where d ∈ {1, 1/2, ..., 1/}
+
+        Shapes produced:
+          spatial_tokens: (B, T, n_s, d_model)
+          action_tokens:  (B, T, 1, d_model)  # if your ActionEncoder emits one token
+          signal_token:   (B, T, 1, d_model)
+          step_token:     (B, T, 1, d_model)
+        """
+        # --- 1) Pack encoder tokens: (B, T, 512, 16) -> (B, T, 256, 32) as example
+        spatial_tokens = rearrange(
+            enc_z, 'b t (n_s k) d -> b t n_s (k d)', k=2, n_s=self.n_s
+        )
+        # Optionally project to d_model if needed (e.g., when feature dim != d_model)
+        if spatial_tokens.shape[-1] != self.d_model:
+            spatial_tokens = self.enc_z_proj(spatial_tokens)
+
+        # --- 2) Encode actions to d_model
+        action_tokens = self.action_encoder(actions)  # (B, T, N_a, d_model)
+
+        # --- 3) Prepare learned register tokens
+        B, T = spatial_tokens.shape[:2]
+        register_tokens = jnp.broadcast_to(
+            self.register_tokens[None, None, ...],  # (1,1,n_r,d_model)
+            (B, T, self.n_r, self.d_model),
+        )
+
+        # --- 4) Shortcut embeddings (discrete lookup)
+        # Embed and add a singleton token dimension:
+        step_tok   = self.step_embed(step_idx)[:, :, None, :]      # (B, T, 1, d_model)
+        signal_tok = self.signal_embed(signal_idx)[:, :, None, :]     # (B, T, 1, d_model)
+
+        # --- 5) Concatenate in your declared layout order
+        tokens = jnp.concatenate(
+            [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens],
+            axis=2
+        )
+
+        tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
+        x = self.transformer(tokens, deterministic=deterministic)
+        spatial_tokens = x[:, :, self.spatial_slice, :]
+        readout = self.flow_x_head(spatial_tokens)
+        return readout
+
 def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)
     B = 2
@@ -504,5 +696,27 @@ def test_encoder_decoder():
     # print(recon_loss)
     # import ipdb; ipdb.set_trace()
 
-if __name__ == "__main__":
-    test_encoder_decoder()
+def test_dynamics():
+    rng = jax.random.PRNGKey(0)
+    B = 2
+    T = 10
+    fake_enc_z = jnp.ones((B, T, 512, 16), dtype=jnp.float32)
+    fake_actions = jnp.ones((B, T), dtype=jnp.int32)
+    fake_signal_idx = jnp.ones((B, T), dtype=jnp.int32)
+    fake_step_idx = jnp.ones((B, T), dtype=jnp.int32)
+    # need some way to assert that 512 * 16 == 256 * 32
+    dynamics = Dynamics(k_max=8, n_s=256, d_model=32, n_r=10, n_heads=4, depth=4, dropout=0.0)
+    dynamics_vars = dynamics.init(
+        {"params": rng, "dropout": jax.random.PRNGKey(2)},
+        fake_enc_z,
+        fake_actions,
+        fake_signal_idx,
+        fake_step_idx,
+    )
+    out = dynamics.apply(dynamics_vars, fake_enc_z, fake_actions,
+                        rngs={"dropout": jax.random.PRNGKey(2)},
+                        deterministic=True)
+    import ipdb; ipdb.set_trace()
+if __name__ == "__main__":  
+    # test_encoder_decoder()
+    test_dynamics()

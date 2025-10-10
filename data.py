@@ -121,7 +121,6 @@ def generate_batch(
     y_idx = positions[..., 0]
     x_idx = positions[..., 1]
     video = paint_over_batch(video, y_idx, x_idx, init_foreground_color, k_b)
-
     return (video.astype(jnp.float32) / 255.0, actions)
 
 
