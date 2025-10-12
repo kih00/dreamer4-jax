@@ -17,26 +17,37 @@ def _with_params(variables, new_params):
     d["params"] = new_params
     return freeze(d)
 
-def sample_shortcut_indices(rng, shape_bt, k_max: int):
+@partial(
+    jax.jit,
+    static_argnames=("shape_bt", "k_max",),
+)
+def sample_shortcut_indices(rng, shape_bt, k_max: int, *, dtype=jnp.float32):
     """
     Returns:
-      step_idx:   (B,T) int32 in [0, log2(k_max)]   where K=2^{step_idx}
-      signal_idx: (B,T) int32 in [0, K-1]           (grid index within the chosen K)
-      tau:        (B,T) float32 in {0/K, 1/K, ..., (K-1)/K}
+      d:         (B,T) float32   step sizes in {1/K | K in {1,2,4,...,k_max}}
+      tau:       (B,T) float32   signal levels in {0, d, 2d, ..., 1-d}
+      step_idx:  (B,T) int32     e = log2(K)  in {0, ..., log2(k_max)}
+      tau_idx:   (B,T) int32     m = tau * k_max in {0, ..., k_max-1}
     """
     B, T = shape_bt
-    max_step = int(jnp.log2(k_max))
+    emax = jnp.log2(k_max).astype(jnp.int32)
     rng_step, rng_tau = jax.random.split(rng)
 
-    step_idx = jax.random.randint(rng_step, (B, T), minval=0, maxval=max_step + 1, dtype=jnp.int32)  # k ~ U{0..max}
-    K = (1 << step_idx).astype(jnp.int32)  # K = 2^k
+    # Sample exponent e -> K = 2^e, d = 1/K
+    step_idx = jax.random.randint(rng_step, (B, T), 0, emax + 1, dtype=jnp.int32)  # e
+    K = (1 << step_idx)                              # (B,T) int32
+    d = (1.0 / K.astype(dtype))                      # (B,T) float32
 
-    # Per-element tau index: uniform integer in [0, K-1]
-    u = jax.random.uniform(rng_tau, (B, T), dtype=jnp.float32)  # in [0,1)
-    signal_idx = jnp.minimum((u * K.astype(jnp.float32)).astype(jnp.int32), K - 1)
+    # Sample j ∈ {0,...,K-1} -> tau = j/K
+    u = jax.random.uniform(rng_tau, (B, T), dtype=dtype)  # [0,1)
+    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)  # (B,T) int32 in [0, K-1]
+    tau = j_idx.astype(dtype) / K.astype(dtype)      # (B,T) float32
 
-    tau = signal_idx.astype(jnp.float32) / K.astype(jnp.float32)  # tau ∈ {0/K, ..., (K-1)/K}
-    return step_idx, signal_idx, tau
+    # Map tau to a *global* K_max-grid index m = tau * K_max = j * (K_max // K)
+    # Do it in integers to avoid rounding error:
+    tau_idx = j_idx * (k_max // K)                   # (B,T) int32 in [0, k_max-1]
+
+    return d, tau, step_idx, tau_idx
 
 def pack_bottleneck_to_spatial(z_btLd, *, n_s: int, k: int):
     """
@@ -56,14 +67,16 @@ def init_models(rng, encoder, dynamics, patch_tokens, B, T, enc_n_latents, enc_d
     fake_enc_z = jnp.ones((B, T, enc_n_latents, enc_d_bottleneck), dtype=jnp.float32)
     fake_packed_z = pack_bottleneck_to_spatial(fake_enc_z, n_s=num_spatial_tokens, k=packing_factor)
     fake_actions = jnp.ones((B, T), dtype=jnp.int32)
-    fake_signal_idx = jnp.ones((B, T), dtype=jnp.int32)
-    fake_step_idx = jnp.ones((B, T), dtype=jnp.int32)
+    fake_signals = jnp.full((B, T), 0.0, dtype=jnp.float32)
+    fake_steps = jnp.full((B, T), 1/256, dtype=jnp.float32)
+    fake_step_idxs = jnp.full((B, T), 0, dtype=jnp.int32)
+    fake_signal_idxs = jnp.full((B, T), 0, dtype=jnp.int32)
     dynamics_vars = dynamics.init(
         {"params": params_rng, "dropout": dropout_rng},
-        fake_packed_z,
         fake_actions,
-        fake_signal_idx,
-        fake_step_idx,
+        fake_step_idxs,
+        fake_signal_idxs,
+        fake_packed_z,
     )
     return rng, enc_vars, dynamics_vars
 
@@ -78,117 +91,104 @@ def init_models(rng, encoder, dynamics, patch_tokens, B, T, enc_n_latents, enc_d
 )
 def train_step(
     encoder: Encoder, dynamics: Dynamics, tx,
-    params, opt_state,               # params = dynamics params ONLY
-    enc_vars, dynamics_vars,         # frozen encoder vars; dynamics vars for non-param cols
-    frames, actions,        # batch inputs
+    params, opt_state,
+    enc_vars, dynamics_vars,
+    frames, actions,
     *,
     patch, H, W, C,
-    n_s: int, k_max: int, packing_factor:int,
+    n_s: int, k_max: int, packing_factor: int,
     normalize_loss: bool = True,
     master_key: jnp.ndarray, step: int,
 ):
-    """
-    One training step:
-      1) Tokenize frames with FROZEN encoder → bottleneck z_clean: (B,T,N_b,D_b)
-      2) Sample (step_idx, signal_idx, tau) per (B,T)
-      3) Corrupt z_clean in bottleneck space: z_tilde = tau * z_clean + (1-tau) * z0
-      4) Run dynamics(enc_z=z_tilde, actions, signal_idx, step_idx) → z_hat (B,T,S_z,D_model)
-      5) Build clean target in projected space with SAME pack + enc_z_proj weights → z_clean_proj
-      6) Loss = mean squared error(z_hat, z_clean_proj)
-      7) Optax update on dynamics params only
-    Returns:
-      new_params, new_opt_state, new_dynamics_vars, metrics
-    """
-    # --- 1) Preprocess frames → patch tokens for the encoder
-    patches_btnd = temporal_patchify(frames, patch)  # (B,T,N_p,D_p)
+    # ---------- precompute (param-free) ----------
+    patches_btnd = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
 
-    # Per-step RNGs
     step_key  = jax.random.fold_in(master_key, step)
     enc_key, noise_key, idx_key, drop_key = jax.random.split(step_key, 4)
 
-    # --- 2) Get FROZEN encoder bottleneck z_clean: (B,T,N_b,D_b)
-    # Run encoder deterministically (no MAE masking); if your encoder ignores rngs when deterministic=True,
-    # you can pass empty rngs; otherwise pass {"mae": enc_key} safely (it shouldn't mask in eval).
-    z_clean, _ = encoder.apply(
+    # Frozen encoder forward
+    z_b_clean, _ = encoder.apply(
         enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True
     )
+    B, T, _, _ = z_b_clean.shape
 
-    B, T, N_b, D_b = z_clean.shape
-    z_packed_clean = pack_bottleneck_to_spatial(z_clean, n_s=n_s, k=packing_factor)
-    import ipdb; ipdb.set_trace()
+    # Pack, sample indices, corrupt
+    z1 = pack_bottleneck_to_spatial(z_b_clean, n_s=n_s, k=packing_factor)  # (B,T,Sz,Dz)
+    step_values, signal_values, step_idxs, signal_idxs = sample_shortcut_indices(idx_key, (B, T), k_max)
 
-    # TODO: implement shortcut forcing.
+    z0      = jax.random.normal(noise_key, z1.shape, dtype=z1.dtype)
+    z_tilde = (1 - signal_values) * z0 + signal_values * z1
 
-    # # --- 3) Sample shortcut indices + corruption in bottleneck space
-    # step_idx_bt, signal_idx_bt, tau_bt = sample_shortcut_indices(idx_key, (B, T), k_max)
-    # z0_btLd = jax.random.normal(noise_key, z_clean.shape, dtype=z_clean.dtype)
-    # mix = tau_bt[..., None, None]        # (B,T,1,1)
-    # z_tilde_btLd = mix * z_clean + (1.0 - mix) * z0_btLd
+    # prepend zero action so t=0 uses a null action
+    actions = jnp.concatenate([jnp.zeros((B, 1), dtype=actions.dtype), actions], axis=1)
 
-    # # --- 4) Forward dynamics on z_tilde
-    # dyn_vars_in = _with_params(dynamics_vars, params)
-    # z_hat_btSzDz = dynamics.apply(
-    #     dyn_vars_in,
-    #     z_tilde_btLd,          # enc_z (noisy)
-    #     actions_bt,            # (B,T) ints
-    #     signal_idx_bt,         # (B,T) ints
-    #     step_idx_bt,           # (B,T) ints
-    #     rngs={"dropout": drop_key},
-    #     deterministic=False,
-    # )  # (B,T,S_z,d_model)
+    # constants/derived indices that don't depend on params
+    max_step_idx         = jnp.log2(k_max).astype(jnp.int32)
+    half_step_values     = step_values / 2
+    half_step_idxs       = jnp.clip(step_idxs + 1, 0, max_step_idx)
+    new_signal_values    = signal_values + half_step_values
+    half_step_signal_idxs= (k_max * half_step_values).astype(jnp.int32)
+    new_signal_idxs      = signal_idxs + half_step_signal_idxs
+    step_mask            = step_idxs == max_step_idx
+    ramp_weight          = 0.9 * signal_values + 0.1  # (B,T)
 
-    # # --- 5) Build CLEAN target in projected space with SAME weights
-    # # Pack: (B,T,N_b,D_b) -> (B,T,S_z, D_pre = 2*D_b)
-    # z_clean_pack = pack_bottleneck_to_spatial(z_clean, n_s=n_s, k=2)  # (B,T,S_z, 2*D_b)
+    # ---------- loss closure (param-dependent only) ----------
+    def loss_and_metrics_with_params(p):
+        dyn_vars_local = _with_params(dynamics_vars, p)
 
-    # # Project using the CURRENT enc_z_proj weights from dynamics params
-    # dparams = params  # dynamics params
-    # if z_clean_pack.shape[-1] != dparams["enc_z_proj"]["kernel"].shape[0]:
-    #     # If your enc_z_proj expects different in-dim you likely changed k; assert or adapt.
-    #     raise ValueError("enc_z_proj input dim mismatch. Check n_s and k.")
-    # W = dparams["enc_z_proj"]["kernel"]       # (D_pre, d_model)
-    # b = dparams["enc_z_proj"]["bias"]         # (d_model,)
-    # z_clean_proj = jnp.einsum('...d,df->...f', z_clean_pack, W) + b  # (B,T,S_z,d_model)
+        # current step
+        z1_hat = dynamics.apply(
+            dyn_vars_local, actions, step_idxs, signal_idxs, z_tilde,
+            rngs={"dropout": drop_key}, deterministic=False,
+        )
 
-    # # --- 6) x-pred loss in projected space
-    # diff = z_hat_btSzDz - z_clean_proj
-    # mse = jnp.sum(diff * diff)
-    # denom = diff.size if normalize_loss else 1.0
-    # loss = mse / denom
+        # first half-step
+        b1 = (dynamics.apply(
+            dyn_vars_local, actions, half_step_idxs, signal_idxs, z_tilde,
+            rngs={"dropout": drop_key}, deterministic=False,
+        ) - z_tilde) / (1 - signal_values)
 
-    # metrics = {
-    #     "loss": loss,
-    #     "mse": mse / denom,
-    #     "K_mean": jnp.mean((1 << step_idx_bt).astype(jnp.float32)),
-    #     "tau_mean": jnp.mean(tau_bt),
-    # }
+        z_mid = z_tilde + b1 * half_step_values
 
-    # # --- 7) Backprop on dynamics params only
-    # def loss_only(p):
-    #     dyn_vars_local = _with_params(dynamics_vars, p)
-    #     # Recompute z_hat with *p*; reuse z_tilde and indices (pure JAX values)
-    #     z_hat = dynamics.apply(
-    #         dyn_vars_local,
-    #         z_tilde_btLd, actions_bt, signal_idx_bt, step_idx_bt,
-    #         rngs={"dropout": drop_key},
-    #         deterministic=False,
-    #     )
-    #     # Target must be recomputed if enc_z_proj lives in params (it does).
-    #     W = p["enc_z_proj"]["kernel"]
-    #     b = p["enc_z_proj"]["bias"]
-    #     z_clean_proj_local = jnp.einsum('...d,df->...f', z_clean_pack, W) + b
-    #     d = z_hat - z_clean_proj_local
-    #     m = jnp.sum(d * d)
-    #     return m / denom
+        # second half-step (advance signal)
+        b2 = (dynamics.apply(
+            dyn_vars_local, actions, half_step_idxs, new_signal_idxs, z_mid,
+            rngs={"dropout": drop_key}, deterministic=False,
+        ) - z_mid) / (1 - new_signal_values)
 
-    # grads = jax.grad(loss_only)(params)
-    # updates, opt_state = tx.update(grads, opt_state, params)
-    # new_params = optax.apply_updates(params, updates)
+        # targets & preds
+        b_targets = jax.lax.stop_gradient(b1 + b2) / 2.0
+        b_preds   = (z1_hat - z_tilde) / (1 - signal_values)
 
-    # # No non-param state in dynamics by default; return as-is
-    # new_dyn_vars = _with_params(dynamics_vars, new_params)
+        # per-sample losses (B,T)
+        b_loss_per    = (1 - signal_values) ** 2 * jnp.mean((b_preds - b_targets) ** 2, axis=(2, 3))
+        flow_loss_per = jnp.mean((z1_hat - z_tilde) ** 2, axis=(2, 3))
 
-    return new_params, opt_state, new_dyn_vars, metrics
+        # choose loss per (B,T)
+        loss_per = jnp.where(step_mask, flow_loss_per, b_loss_per)
+
+        # ramp weighting → scalar loss
+        loss = jnp.mean(loss_per * ramp_weight)
+
+        aux = {
+            "loss": loss,
+            "flow_loss": jnp.mean(flow_loss_per * step_mask),
+            "weighted_flow_loss": jnp.mean(flow_loss_per * step_mask * ramp_weight),
+            "bootstrap_loss": jnp.mean(b_loss_per * ~step_mask),
+            "weighted_bootstrap_loss": jnp.mean(b_loss_per * ~step_mask * ramp_weight),
+        }
+        return loss, aux
+
+    (loss_val, aux_out), grads = jax.value_and_grad(
+        loss_and_metrics_with_params, has_aux=True
+    )(params)
+
+    updates, opt_state = tx.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    new_dynamics_vars = _with_params(dynamics_vars, new_params)
+
+    return new_params, opt_state, new_dynamics_vars, aux_out
+
 
 
 if __name__ == "__main__":
@@ -201,7 +201,7 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(0)
     # dataset parameters
-    B, T, H, W, C = 64, 4, 32, 32, 3
+    B, T, H, W, C = 8, 64, 32, 32, 3
     pixels_per_step = 2 # how many pixels the agent moves per step
     size_min = 6 # minimum size of the square
     size_max = 14 # maximum size of the square
@@ -211,7 +211,7 @@ if __name__ == "__main__":
     patch = 4
     num_patches = (H // patch) * (W // patch)
     D_patch = patch * patch * C
-    k_max = 8
+    k_max = 256
 
     # data
     next_batch = make_iterator(B, T, H, W, C, pixels_per_step, size_min, size_max, hold_min, hold_max)

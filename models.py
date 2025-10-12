@@ -7,6 +7,7 @@ import flax
 from enum import IntEnum
 from typing import Optional, Tuple, Any
 from einops import rearrange
+import math
 
 class Modality(IntEnum):
     LATENT   = -1
@@ -565,27 +566,24 @@ class Dynamics(nn.Module):
         )
 
         # -------- Discrete embeddings for shortcut conditioning --------
-        # Step size d ∈ {1, 1/2, 1/4, ..., 1/}
-        # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ..., log2()}
-        self.num_step_bins = int(jnp.log2(self.k_max)) + 1
+        # Step size d ∈ {1, 1/2, 1/4, ..., 1/256}
+        # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ...,7, 8}
+        self.num_step_bins = int(math.log2(self.k_max)) + 1
         self.step_embed = nn.Embed(self.num_step_bins, self.d_model, name="step_embed")
 
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
-        # Indexing: signal_idx = τ / d ∈ {0, 1, ..., (1/d) - 1}
-        self.signal_embed = nn.Embed(self.k_max, self.d_model, name="signal_embed")
+        self.signal_embed = nn.Embed(self.k_max + 1, self.d_model, name="signal_embed")
         self.flow_x_head = nn.Dense(self.d_spatial, name="flow_x_head")
 
     @nn.compact
-    def __call__(self, packed_enc_tokens, actions, signal_idx, step_idx, *, deterministic: bool = True):
+    def __call__(self,actions, step_idxs, signal_idxs, packed_enc_tokens, *, deterministic: bool = True):
         """
         Args:
           packed_enc_tokens:      (B, T, n_s, d_spatial) packed encoder tokens
           actions:    (B, T, N_a, D_a) raw action tokens
-          signal_idx: (B, T) int32 — τ index on the grid for the chosen step size:
-                        signal_idx = τ / d, ∈ {0, 1, ..., 1/d - 1}
-          step_idx:   (B, T) int32 — step size index:
-                        step_idx = log2(1/d), where d ∈ {1, 1/2, ..., 1/}
+          steps:      (B, T) float32 — step sizes, 1/2^x
+          signals:    (B, T) float32 - signal values, grid that is reachable by current step size
 
         Shapes produced:
           spatial_tokens: (B, T, n_s, d_model)
@@ -608,8 +606,12 @@ class Dynamics(nn.Module):
 
         # --- 4) Shortcut embeddings (discrete lookup)
         # Embed and add a singleton token dimension:
-        step_tok   = self.step_embed(step_idx)[:, :, None, :]      # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(signal_idx)[:, :, None, :]     # (B, T, 1, d_model)
+        # convert the step value (1/2^x) to an index
+        # step_idx = jnp.log2(steps).astype(jnp.int32)
+        step_tok   = self.step_embed(step_idxs)[:, :, None, :]      # (B, T, 1, d_model)
+        # signal will be some fraction a/b, need to express it as x/256 where x is an integer.
+        # signal_idx = jnp.round(signals * 256).astype(jnp.int32)
+        signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]     # (B, T, 1, d_model)
 
         # --- 5) Concatenate in your declared layout order
         tokens = jnp.concatenate(
@@ -700,8 +702,8 @@ def test_dynamics():
     T = 10
     fake_enc_z = jnp.ones((B, T, 512, 16), dtype=jnp.float32)
     fake_actions = jnp.ones((B, T), dtype=jnp.int32)
-    fake_signal_idx = jnp.ones((B, T), dtype=jnp.int32)
-    fake_step_idx = jnp.ones((B, T), dtype=jnp.int32)
+    fake_steps = jnp.full((B, T), 1/256, dtype=jnp.float32)
+    fake_signals = jnp.full((B, T), 0.0, dtype=jnp.float32)
     def pack_bottleneck_to_spatial(z_btLd, *, n_s: int, k: int):
         """
         (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
@@ -726,12 +728,12 @@ def test_dynamics():
     dynamics = Dynamics(**dynamics_kwargs)
     dynamics_vars = dynamics.init(
         {"params": rng, "dropout": jax.random.PRNGKey(2)},
-        fake_packed_enc_tokens,
         fake_actions,
-        fake_signal_idx,
-        fake_step_idx,
+        fake_steps,
+        fake_signals,
+        fake_packed_enc_tokens,
     )
-    out = dynamics.apply(dynamics_vars, fake_packed_enc_tokens, fake_actions, fake_signal_idx, fake_step_idx,
+    out = dynamics.apply(dynamics_vars, fake_actions, fake_steps, fake_signals, fake_packed_enc_tokens,
                         rngs={"dropout": jax.random.PRNGKey(2)},
                         deterministic=True)
 if __name__ == "__main__":  
