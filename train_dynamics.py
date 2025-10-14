@@ -2,20 +2,14 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
-from flax.core import freeze, unfreeze, FrozenDict
-from models import Encoder, Dynamics
+from models import Encoder, Decoder, Dynamics
 from data import make_iterator
-import imageio
 from pathlib import Path
 from time import time
-from utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save
+from utils import pack_mae_params, temporal_patchify, make_state, make_manager, try_restore, maybe_save, with_params
 from einops import rearrange
+import orbax.checkpoint as ocp
 
-def _with_params(variables, new_params):
-    """Replace the 'params' collection in a Flax variables PyTree."""
-    d = unfreeze(variables) if isinstance(variables, FrozenDict) else dict(variables)
-    d["params"] = new_params
-    return freeze(d)
 
 @partial(
     jax.jit,
@@ -118,9 +112,6 @@ def train_step(
     z0      = jax.random.normal(noise_key, z1.shape, dtype=z1.dtype)
     z_tilde = (1 - signal_values) * z0 + signal_values * z1
 
-    # prepend zero action so t=0 uses a null action
-    actions = jnp.concatenate([jnp.zeros((B, 1), dtype=actions.dtype), actions], axis=1)
-
     # constants/derived indices that don't depend on params
     max_step_idx         = jnp.log2(k_max).astype(jnp.int32)
     half_step_values     = step_values / 2
@@ -133,7 +124,7 @@ def train_step(
 
     # ---------- loss closure (param-dependent only) ----------
     def loss_and_metrics_with_params(p):
-        dyn_vars_local = _with_params(dynamics_vars, p)
+        dyn_vars_local = with_params(dynamics_vars, p)
 
         # current step
         z1_hat = dynamics.apply(
@@ -184,7 +175,7 @@ def train_step(
 
     updates, opt_state = tx.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
-    new_dynamics_vars = _with_params(dynamics_vars, new_params)
+    new_dynamics_vars = with_params(dynamics_vars, new_params)
 
     return new_params, opt_state, new_dynamics_vars, aux_out
 
@@ -211,14 +202,11 @@ def _sample_step_excluding_dmin(rng, shape_bt, k_max:int):
     d = 1.0 / (1 << step_idx).astype(jnp.float32)
     return d, step_idx
 
-def _pack_bottleneck_to_spatial(z_btLd, *, n_s:int, k:int):
-    return rearrange(z_btLd, 'b t (n_s k) d -> b t n_s (k d)', n_s=n_s, k=k)
-
 
 @partial(
     jax.jit,
     static_argnames=("encoder","dynamics","tx","patch",
-                     "n_s","k_max","packing_factor"),
+                     "n_s","k_max","packing_factor","B","T","B_self"),
 )
 def train_step_efficient(
     encoder, dynamics, tx,
@@ -226,96 +214,117 @@ def train_step_efficient(
     enc_vars, dynamics_vars,
     frames, actions,
     *,
-    patch,
-    n_s:int, k_max:int, packing_factor:int,
-    k_self: float = 0.25,
+    patch: int,
+    B: int, T: int, B_self: int,            # assume 0 < B_self < B (deterministic split)
+    n_s: int, k_max: int, packing_factor: int,
     master_key: jnp.ndarray, step: int,
 ):
-    # ----- param-free precompute -----
-    patches_btnd = temporal_patchify(frames, patch)
-    step_key  = jax.random.fold_in(master_key, step)
-    enc_key, key_emp_tau, key_self_step, key_self_tau, key_noise_emp, key_noise_self, drop_key = jax.random.split(step_key, 7)
+    """
+    Deterministic two-branch training:
+      - first B_emp rows: empirical flow at smallest step d_min = 1/k_max
+      - last  B_self rows: self-consistency with d > d_min
+    One fused main forward (emp + self), then two half-step forwards only for self rows.
 
-    # frozen encoder
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
-    B, T, _, _ = z_btLd.shape
-    z1 = _pack_bottleneck_to_spatial(z_btLd, n_s=n_s, k=packing_factor)
+    Notation:
+      sigma ∈ [0,1]  : signal level
+      d ∈ {1, 1/2, 1/4, ..., 1/k_max} : step size (delta)
+      z_tilde = (1 - sigma) z0 + sigma z1
+      b'  = (f(z_tilde, sigma, d/2) - z_tilde) / (1 - sigma)
+      z'  = z_tilde + b' * (d/2)
+      b'' = (f(z', sigma + d/2, d/2) - z') / (1 - (sigma + d/2))
+      vhat_sigma = (f(z_tilde, sigma, d) - z_tilde) / (1 - sigma)
+      L_flow = || f(z_tilde, sigma, d_min) - z1 ||^2
+      L_boot = (1 - sigma)^2 * || vhat_sigma - stopgrad((b' + b'')/2) ||^2
+      w(sigma) = 0.9 * sigma + 0.1
+    """
+    # ---------- Param-free precompute ----------
+    patches_btnd = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
 
-    # deterministic batch split (assume both parts are non-empty)
-    B_self = jnp.int32(jnp.round(k_self * B))
+    # RNGs: encoder MAE, sigma sampling, self step sampling, corruption, dropout
+    step_key = jax.random.fold_in(master_key, step)
+    enc_key, key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 5)
+
+    # Frozen encoder → bottleneck → spatial tokens (clean target z1)
+    z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
+    z1 = pack_bottleneck_to_spatial(z_bottleneck, n_s=n_s, k=packing_factor)  # (B,T,Sz,Dz)
+
+    # Deterministic batch split
     B_emp  = B - B_self
+    actions_full = actions
+    emax = jnp.log2(k_max).astype(jnp.int32)  # exponent index for d_min
 
-    acts_full = jnp.concatenate([jnp.zeros((B,1), dtype=actions.dtype), actions], axis=1)
-    emax = jnp.log2(k_max).astype(jnp.int32)
-
-    # empirical indices (d_min)
-    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
-    tau_emp, tau_idx_emp = _sample_tau_for_step(key_emp_tau, (B_emp, T), k_max, step_idx_emp)
-
-    # self indices (d > d_min)
-    d_self, step_idx_self = _sample_step_excluding_dmin(key_self_step, (B_self, T), k_max)
-    tau_self, tau_idx_self = _sample_tau_for_step(key_self_tau, (B_self, T), k_max, step_idx_self)
-
-    # corruption
-    z0_emp  = jax.random.normal(key_noise_emp,  z1[:B_emp].shape,  dtype=z1.dtype)
-    zt_emp  = (1 - tau_emp)[...,None,None]  * z0_emp  + tau_emp[...,None,None]  * z1[:B_emp]
-    z0_self = jax.random.normal(key_noise_self, z1[B_emp:].shape, dtype=z1.dtype)
-    zt_self = (1 - tau_self)[...,None,None] * z0_self + tau_self[...,None,None] * z1[B_emp:]
-
-    # ramp weights
-    ramp_emp  = 0.9 * tau_emp  + 0.1
-    ramp_self = 0.9 * tau_self + 0.1
-
-    # fuse MAIN pass inputs
+    # --- Step indices (encode d) ---
+    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min for empirical rows
+    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)  # d > d_min for self rows
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
-    tau_idx_full  = jnp.concatenate([tau_idx_emp,  tau_idx_self],  axis=0)   # (B,T)
-    zt_full       = jnp.concatenate([zt_emp,       zt_self],       axis=0)   # (B,T,Sz,Dz)
 
-    # self half-step metadata
-    half_d        = d_self / 2.0
-    half_sid      = jnp.clip(step_idx_self + 1, 0, emax)
-    tau_next      = tau_self + half_d
-    half_tadd     = (k_max * half_d).astype(jnp.int32)
-    tau_idx_next  = tau_idx_self + half_tadd
+    # --- Signal levels on each row's grid (one call for whole batch) ---
+    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), k_max, step_idx_full)
+    sigma_emp   = sigma_full[:B_emp]                   # (B_emp,T)
+    sigma_self  = sigma_full[B_emp:]                   # (B_self,T)
+    sigma_idx_self = sigma_idx_full[B_emp:]            # (B_self,T)
+
+    # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 (one draw for all rows) ---
+    z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
+    z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * z1
+    z_tilde_self = z_tilde_full[B_emp:]                # (B_self,T,Sz,Dz)
+
+    # --- Ramp weights w(sigma) ---
+    w_emp  = 0.9 * sigma_emp  + 0.1
+    w_self = 0.9 * sigma_self + 0.1
+
+    # --- Half-step metadata for self rows (names mirror b', z', b'') ---
+    d_half            = d_self / 2.0                                         # (B_self,T)
+    step_idx_half     = step_idx_self + 1                                    # halve step → double K
+    sigma_plus        = sigma_self + d_half                                  # σ + d/2
+    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)  # global grid shift for σ + d/2
 
     def loss_and_aux(p):
-        dyn_vars = _with_params(dynamics_vars, p)
+        dyn_vars = with_params(dynamics_vars, p)
+        drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
-        # ONE fused main forward (emp + self)
+        # ---------- ONE fused main forward (emp + self) ----------
         z1_hat_full = dynamics.apply(
-            dyn_vars, acts_full, step_idx_full, tau_idx_full, zt_full,
-            rngs={"dropout": drop_key}, deterministic=False,
+            dyn_vars, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
+            rngs={"dropout": drop_main}, deterministic=False,
         )  # (B,T,Sz,Dz)
 
-        # split outputs
-        z1_hat_emp  = z1_hat_full[:B_emp]
-        z1_hat_self = z1_hat_full[B_emp:]
+        # Split outputs
+        z1_hat_emp  = z1_hat_full[:B_emp]     # (B_emp,T,Sz,Dz)
+        z1_hat_self = z1_hat_full[B_emp:]     # (B_self,T,Sz,Dz)
 
-        # empirical (flow) loss
-        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))       # (B_emp,T)
-        loss_emp = jnp.mean(flow_per * ramp_emp)
+        # ---------- Empirical flow loss ----------
+        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))        # (B_emp,T)
+        loss_emp = jnp.mean(flow_per * w_emp)
 
-        # self-consistency: two extra passes only for self rows
-        # half 1
+        # ---------- Self-consistency (bootstrap) ----------
+        # b' = (f(z_tilde, sigma, d/2) - z_tilde) / (1 - sigma)
         z1_hat_half1 = dynamics.apply(
-            dyn_vars, acts_full[B_emp:], half_sid, tau_idx_self, zt_self,
-            rngs={"dropout": drop_key}, deterministic=False,
+            dyn_vars, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
+            rngs={"dropout": drop_h1}, deterministic=False,
         )
-        b1 = (z1_hat_half1 - zt_self) / (1.0 - tau_self)[...,None,None]
-        z_mid = zt_self + b1 * half_d[...,None,None]
-        # half 2
+        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+
+        # z' = z_tilde + b' * (d/2)
+        z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+
+        # b'' = (f(z', sigma + d/2, d/2) - z') / (1 - (sigma + d/2))
         z1_hat_half2 = dynamics.apply(
-            dyn_vars, acts_full[B_emp:], half_sid, tau_idx_next, z_mid,
-            rngs={"dropout": drop_key}, deterministic=False,
+            dyn_vars, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
+            rngs={"dropout": drop_h2}, deterministic=False,
         )
-        b2 = (z1_hat_half2 - z_mid) / (1.0 - tau_next)[...,None,None]
+        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
 
-        b_tgt  = jax.lax.stop_gradient((b1 + b2) / 2.0)
-        b_pred = (z1_hat_self - zt_self) / (1.0 - tau_self)[...,None,None]
-        boot_per = (1.0 - tau_self)**2 * jnp.mean((b_pred - b_tgt)**2, axis=(2,3))
-        loss_self = jnp.mean(boot_per * ramp_self)
+        # vhat_sigma = (z1_hat_self - z_tilde_self) / (1 - sigma)
+        # vbar_target = stopgrad((b' + b'') / 2)
+        vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+        vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
 
-        # combine (row-weighted)
+        # L_boot in x-space: (1 - sigma)^2 * || vhat_sigma - vbar_target ||^2
+        boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+        loss_self = jnp.mean(boot_per * w_self)
+
+        # ---------- Combine (row-weighted) ----------
         loss = ((loss_emp * B_emp) + (loss_self * B_self)) / B
 
         aux = {
@@ -324,28 +333,110 @@ def train_step_efficient(
             "bootstrap_loss": jnp.mean(boot_per),
             "weighted_flow_loss": loss_emp,
             "weighted_bootstrap_loss": loss_self,
-            "frac_self": jnp.float32(B_self) / jnp.float32(B),
         }
         return loss, aux
 
     (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
     updates, opt_state = tx.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
-    new_vars = _with_params(dynamics_vars, new_params)
+    new_vars = with_params(dynamics_vars, new_params)
     return new_params, opt_state, new_vars, aux
 
+def _read_only_tokenizer_meta(tokenizer_ckpt_dir: str):
+    """Restore just the JSON meta from a tokenizer checkpoint directory."""
+    meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
+    latest = meta_mngr.latest_step()
+    if latest is None:
+        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
+    restored = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+    return latest, restored.meta
+
+
+def load_pretrained_encoder_params(
+    tokenizer_ckpt_dir: str,
+    *,
+    rng: jnp.ndarray,
+    encoder: Encoder,
+    enc_vars,
+    sample_patches_btnd,
+):
+    """Return enc_vars with restored encoder params from tokenizer ckpt (discard decoder)."""
+    # -- (A) read meta only with a meta-only manager
+    latest, meta = _read_only_tokenizer_meta(tokenizer_ckpt_dir)
+    if "enc_kwargs" not in meta or "dec_kwargs" not in meta:
+        raise ValueError("Tokenizer checkpoint meta missing enc_kwargs/dec_kwargs")
+    enc_kwargs = meta["enc_kwargs"]
+    dec_kwargs = meta["dec_kwargs"]
+
+    # -- (B) build abstract trees that match the saved structure
+    dec = Decoder(**dec_kwargs)
+    rng_e1, rng_e2, rng_d1 = jax.random.split(rng, 3)
+
+    B, T = sample_patches_btnd.shape[:2]
+    n_lat = enc_kwargs["n_latents"]
+    d_b   = enc_kwargs["d_bottleneck"]
+    fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
+
+    dec_vars = dec.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
+
+    packed_example = pack_mae_params(enc_vars, dec_vars)
+
+    tx_dummy = optax.adamw(1e-4)
+    opt_state_example = tx_dummy.init(packed_example)
+
+    state_example = make_state(
+        params=packed_example,
+        opt_state=opt_state_example,
+        rng=rng_e2,
+        step=0,
+    )
+    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
+
+    # -- (C) now do a full restore (state + meta) using a manager with both items
+    tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
+    restored = tok_mngr.restore(
+        latest,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardRestore(abstract_state),
+            meta=ocp.args.JsonRestore(),
+        )
+    )
+
+    packed_params = restored.state["params"]        # {"enc": ..., "dec": ...}
+    enc_params = packed_params["enc"]
+    new_enc_vars = with_params(enc_vars, enc_params)
+    return new_enc_vars, meta
+
+def make_dynamics_meta(
+    *,
+    enc_kwargs: dict,
+    dynamics_kwargs: dict,
+    H: int, W: int, C: int,
+    patch: int,
+    k_max: int,
+    packing_factor: int,
+    n_s: int,
+    tokenizer_ckpt_dir: str | None = None,
+):
+    return {
+        "enc_kwargs": enc_kwargs,
+        "dynamics_kwargs": dynamics_kwargs,
+        "H": H, "W": W, "C": C, "patch": patch,
+        "k_max": k_max,
+        "packing_factor": packing_factor,
+        "n_s": n_s,
+        "tokenizer_ckpt_dir": tokenizer_ckpt_dir,
+    }
 
 if __name__ == "__main__":
-    log_dir = Path("./logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path("./logs"); log_dir.mkdir(parents=True, exist_ok=True)
     run_name = "test_dynamics"
-    run_dir = log_dir / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-
+    run_dir = log_dir / run_name; run_dir.mkdir(parents=True, exist_ok=True)
 
     rng = jax.random.PRNGKey(0)
-    # dataset parameters
+    # dataset parameters ...
     B, T, H, W, C = 8, 64, 32, 32, 3
+    B_self = int(0.25 * B)
     pixels_per_step = 2 # how many pixels the agent moves per step
     size_min = 6 # minimum size of the square
     size_max = 14 # maximum size of the square
@@ -357,59 +448,117 @@ if __name__ == "__main__":
     D_patch = patch * patch * C
     k_max = 256
 
-    # data
+
+    patch = 4
+    num_patches = (H // patch) * (W // patch)
+    D_patch = patch * patch * C
+    k_max = 256
+
     next_batch = make_iterator(B, T, H, W, C, pixels_per_step, size_min, size_max, hold_min, hold_max)
-
     rng, batch_rng = jax.random.split(rng)
-    rng, (frames, actions) = next_batch(rng) 
+    rng, (frames, actions) = next_batch(rng)
 
-    # models 
+    # ----- models -----
     enc_n_latents, enc_d_bottleneck = 16, 32
     enc_kwargs = {
-        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches, "n_heads": 4, "depth": 8, "dropout": 0.0,
+        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches,
+        "n_heads": 4, "depth": 8, "dropout": 0.0,
         "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.1, "mae_p_max": 0.1, "time_every": 4,
     }
     packing_factor = 2
     n_s = enc_n_latents // packing_factor
     dynamics_kwargs = {
-        "d_model": 128,
-        "n_s": n_s,
-        "d_spatial": enc_d_bottleneck * packing_factor,
-        "d_bottleneck": enc_d_bottleneck,
-        "k_max": k_max,
-        "n_r": 10,
-        "n_heads": 4,
-        "depth": 4,
-        "dropout": 0.0
+        "d_model": 128, "n_s": n_s, "d_spatial": enc_d_bottleneck * packing_factor,
+        "d_bottleneck": enc_d_bottleneck, "k_max": k_max, "n_r": 10,
+        "n_heads": 4, "depth": 4, "dropout": 0.0
     }
 
     encoder = Encoder(**enc_kwargs)
     dynamics = Dynamics(**dynamics_kwargs)
 
     init_patches = temporal_patchify(frames, patch)
-    rng, enc_vars, dynamics_vars = init_models(rng, encoder, dynamics, init_patches, B, T, enc_n_latents, enc_d_bottleneck, packing_factor, n_s)
+    rng, enc_vars, dynamics_vars = init_models(
+        rng, encoder, dynamics, init_patches, B, T, enc_n_latents, enc_d_bottleneck,
+        packing_factor, n_s
+    )
 
+    # ====== (A) Optional: load a pretrained encoder from tokenizer checkpoints ======
+    # Set this path if you want to load a trained encoder; otherwise leave as None to use fresh init.
+    TOKENIZER_CKPT_DIR = "/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints" 
+    if TOKENIZER_CKPT_DIR is not None:
+        # use init_patches as sample to build shapes if needed
+        enc_vars, tok_meta = load_pretrained_encoder_params(
+            TOKENIZER_CKPT_DIR,
+            rng=rng,
+            encoder=encoder,
+            enc_vars=enc_vars,
+            sample_patches_btnd=init_patches,
+        )
+        print(f"[encoder] Restored pretrained encoder params from: {TOKENIZER_CKPT_DIR}")
+    # ----- dynamics trainables -----
     params = dynamics_vars["params"]
     tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
     max_steps = 1_000_000
 
-    # ---------- ORBAX: manager + (optional) restore ----------
-    ckpt_dir = run_dir / "checkpoints"
+    # ====== (B) Orbax manager for dynamics run + try to restore ======
+    ckpt_dir = (run_dir / "checkpoints")
     mngr = make_manager(ckpt_dir, max_to_keep=5, save_interval_steps=10_000)
+
+    meta = make_dynamics_meta(
+        enc_kwargs=enc_kwargs,
+        dynamics_kwargs=dynamics_kwargs,
+        H=H, W=W, C=C, patch=patch,
+        k_max=k_max, packing_factor=packing_factor, n_s=n_s,
+        tokenizer_ckpt_dir=TOKENIZER_CKPT_DIR
+    )
+
+    # Build example trees for safe restore
+    state_example = make_state(params, opt_state, rng, step=0)
+    restored = try_restore(mngr, state_example, meta)
+
+    start_step = 0
+    if restored is not None:
+        latest_step, r = restored
+        params     = r.state["params"]
+        opt_state  = r.state["opt_state"]
+        rng        = r.state["rng"]
+        start_step = int(r.state["step"])
+        dynamics_vars = with_params(dynamics_vars, params)
+        print(f"[dynamics] Restored checkpoint step={latest_step} from {ckpt_dir}")
+
+    # ====== (C) Training loop with periodic save ======
     from collections import deque
-    running_time_avg = deque(maxlen=5)
-    for step in range(10):
-        data_start_t = time()
-        rng, (frames, actions) = next_batch(rng)
-        data_t = time() - data_start_t
-        train_start_t = time()
-        rng, master_key = jax.random.split(rng)
-        params, opt_state, dynamics_vars, aux = train_step(
-            encoder, dynamics, tx, params, opt_state, enc_vars, dynamics_vars, frames, actions,
-            patch=patch, master_key=master_key, step=step, packing_factor=packing_factor, n_s=n_s, k_max=k_max,
-        )
-        train_t = time() - train_start_t
-        print(f"Step {step} took {train_t} seconds")
-        running_time_avg.append(train_t)
-        print(f"Running time average: {sum(running_time_avg) / len(running_time_avg)} seconds")
+    running_time_avg = deque(maxlen=10)
+
+    try:
+        for step in range(start_step, max_steps):
+            data_start_t = time()
+            rng, (frames, actions) = next_batch(rng)
+            data_t = time() - data_start_t
+
+            train_start_t = time()
+            rng, master_key = jax.random.split(rng)
+            params, opt_state, dynamics_vars, aux = train_step_efficient(
+                encoder, dynamics, tx, params, opt_state, enc_vars, dynamics_vars,
+                frames, actions,
+                patch=patch, B=B, T=T, B_self=B_self,
+                master_key=master_key, step=step,
+                packing_factor=packing_factor, n_s=n_s, k_max=k_max,
+            )
+            train_t = time() - train_start_t
+
+            # logging …
+            if step % 100 == 0:
+                print(f"step {step:05d} | loss={float(aux['loss']):.6f} | time={train_t:.3f}s")
+
+            # save (async) when policy says we should
+            state = make_state(params, opt_state, rng, step)
+            maybe_save(mngr, step, state, meta)
+
+            # simple runtime smoothing
+            running_time_avg.append(train_t)
+            if step % 100 == 0:
+                print(f"running avg: {sum(running_time_avg)/len(running_time_avg):.3f}s")
+    finally:
+        mngr.wait_until_finished()

@@ -486,7 +486,7 @@ class Decoder(nn.Module):
 
 class ActionEncoder(nn.Module):
     d_model: int
-    n_keyboard: int = 4  # up, down, left, right (categorical actions)
+    n_keyboard: int = 5  # up, down, left, right, null (categorical actions)
 
     @nn.compact
     def __call__(

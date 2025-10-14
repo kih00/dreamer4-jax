@@ -2,14 +2,13 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
-from flax.core import freeze, unfreeze, FrozenDict
 from models import Encoder, Decoder
 from data import make_iterator
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 from time import time
-from utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save
+from utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 
 
 
@@ -26,25 +25,6 @@ def init_models(rng, encoder, decoder, patch_tokens, B, T, enc_n_latents, enc_d_
         fake_z, deterministic=True
     )
     return rng, enc_vars, dec_vars
-
-# Pack params so we can optimize both modules with one optimizer.
-def pack_params(enc_vars, dec_vars):
-    return FrozenDict({
-        "enc": enc_vars["params"],
-        "dec": dec_vars["params"],
-    })
-
-def _with_params(variables, new_params):
-    # works whether `variables` is a FrozenDict or a plain dict
-    d = unfreeze(variables) if isinstance(variables, FrozenDict) else dict(variables)
-    d["params"] = new_params
-    return freeze(d)
-
-def unpack_params(packed_params, enc_vars, dec_vars):
-    enc_vars = _with_params(enc_vars, packed_params["enc"])
-    dec_vars = _with_params(dec_vars, packed_params["dec"])
-    return enc_vars, dec_vars
-
 
 # --- forward (no jit; we jit the train_step) ---
 def forward_apply(encoder, decoder, enc_vars, dec_vars, patches_btnd, *, mae_key, drop_key, train: bool):
@@ -161,7 +141,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     # 3) Define loss fn (closes over encoder/decoder + non-param states)
     def loss_fn(packed_params):
         # Replace params in vars
-        ev, dv = unpack_params(packed_params, enc_vars, dec_vars)
+        ev, dv = unpack_mae_params(packed_params, enc_vars, dec_vars)
         pred, mae_info = forward_apply(encoder, decoder, ev, dv, patches_btnd,
                                        mae_key=mae_key, drop_key=drop_key, train=True)
         mae_mask, keep_prob = mae_info
@@ -194,7 +174,7 @@ def train_step(encoder, decoder, tx, params, opt_state, enc_vars, dec_vars, batc
     new_params = optax.apply_updates(params, updates)
 
     # 5) Put params back into variables for next step
-    new_enc_vars, new_dec_vars = unpack_params(new_params, enc_vars, dec_vars)
+    new_enc_vars, new_dec_vars = unpack_mae_params(new_params, enc_vars, dec_vars)
     return new_params, opt_state, new_enc_vars, new_dec_vars, aux
 
 if __name__ == "__main__":
@@ -251,7 +231,7 @@ if __name__ == "__main__":
     rng, enc_vars, dec_vars = init_models(rng, encoder, decoder, first_patches, B, T, enc_n_latents, enc_d_bottleneck)
 
     # optim
-    params = pack_params(enc_vars, dec_vars)
+    params = pack_mae_params(enc_vars, dec_vars)
     tx = optax.adamw(1e-4)
     opt_state = tx.init(params)
     max_steps = 1_000_000
@@ -277,7 +257,7 @@ if __name__ == "__main__":
         # Optional: you can read r.meta here if you want to sanity-check config.
 
         # Rebuild enc_vars/dec_vars from params so downstream apply() uses the restored params.
-        enc_vars, dec_vars = unpack_params(params, enc_vars, dec_vars)
+        enc_vars, dec_vars = unpack_mae_params(params, enc_vars, dec_vars)
         print(f"Restored checkpoint at step {latest_step} from {ckpt_dir}")
 
     # ---------- Train loop ----------

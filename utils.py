@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
+from flax.core import freeze, unfreeze, FrozenDict
 
 
 # --- helpers ---
@@ -16,8 +17,26 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
-
 # -------- Checkpoint helpers --------
+def with_params(variables, new_params):
+    # works whether `variables` is a FrozenDict or a plain dict
+    d = unfreeze(variables) if isinstance(variables, FrozenDict) else dict(variables)
+    d["params"] = new_params
+    return freeze(d)
+
+# Pack params so we can optimize both modules with one optimizer.
+def pack_mae_params(enc_vars, dec_vars):
+    return FrozenDict({
+        "enc": enc_vars["params"],
+        "dec": dec_vars["params"],
+    })
+
+def unpack_mae_params(packed_params, enc_vars, dec_vars):
+    enc_vars = with_params(enc_vars, packed_params["enc"])
+    dec_vars = with_params(dec_vars, packed_params["dec"])
+    return enc_vars, dec_vars
+
+
 def make_state(params, opt_state, rng, step):
     # Pack training state as a PyTree; JAX/Orbax-friendly types only.
     return {

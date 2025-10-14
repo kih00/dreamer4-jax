@@ -26,6 +26,10 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [x] Add multi-modality support for efficient transformer block
     - [x] setup architecture
         - [x] need to generalize tokenizer preprocessing logic
+        - [x] need a "null" action
+        - [ ] key / value caching for faster generation
+            - [ ] K/V cache across diffusion sampling
+            - [ ] K/V cache across timesteps
     - [ ] training loop
         - [x] data loading, need to import an encoder and forward the data.
         - [x] shortcut loss function 

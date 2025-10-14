@@ -36,7 +36,7 @@ def generate_batch(
     init_background_color: jnp.ndarray,  # (B, C) uint8 — per-sample background color
     init_foreground_color: jnp.ndarray,  # (B, C) uint8 — per-sample square color
     square_sizes: jnp.ndarray,           # (B,) int32  — side length per sample
-    actions: jnp.ndarray,                # (B, T-1) int32 ∈ {0,1,2,3}
+    actions: jnp.ndarray,                # (B, T) int32 ∈ {0,1,2,3,4}
     batch_size: int,
     time_steps: int,
     height: int,
@@ -235,7 +235,7 @@ def make_iterator(
             new_key: updated PRNGKey
             (video, actions):
                 video   (B,T,H,W,C) float32 in [0,1]
-                actions (B,T-1) int32 in {0,1,2,3}
+                actions (B,T) int32 in {0,1,2,3}
         """
         key, sub = jax.random.split(key)
         k_pos, k_bg, k_fg, k_size, k_act = jax.random.split(sub, 5)
@@ -267,6 +267,8 @@ def make_iterator(
 
         # generate video
         video, _ = gen(init_pos, init_bg, init_fg, sizes, actions)
+        # prepend an empty action (value = 4) at t=0
+        actions = jnp.concatenate([jnp.full((batch_size,1), 4, dtype=actions.dtype), actions], axis=1)
         return key, (video, actions)
 
     return next
