@@ -188,7 +188,7 @@ if __name__ == "__main__":
 
     rng = jax.random.PRNGKey(0)
     # dataset parameters
-    B, T, H, W, C = 64, 4, 32, 32, 3
+    B, T, H, W, C = 32, 64, 32, 32, 3
     pixels_per_step = 2 # how many pixels the agent moves per step
     size_min = 6 # minimum size of the square
     size_max = 14 # maximum size of the square
@@ -217,12 +217,12 @@ if __name__ == "__main__":
     # models
     enc_n_latents, enc_d_bottleneck = 16, 32
     enc_kwargs = {
-        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches, "n_heads": 4, "depth": 8, "dropout": 0.0,
-        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.1, "mae_p_max": 0.1, "time_every": 4,
+        "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches, "n_heads": 4, "depth": 8, "dropout": 0.05,
+        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.15, "time_every": 4,
     }
     dec_kwargs = {
         "d_model": 64, "n_heads": 4, "n_patches": num_patches, "n_latents": enc_n_latents, "depth": 8,
-        "d_patch": D_patch, "dropout": 0.0, "time_every": 4,
+        "d_patch": D_patch, "dropout": 0.05, "time_every": 4,
     }
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
