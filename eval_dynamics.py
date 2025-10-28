@@ -331,12 +331,12 @@ if __name__ == "__main__":
     enc_n_latents, enc_d_bottleneck = 16, 32
     enc_kwargs = {
         "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches,
-        "n_heads": 4, "depth": 8, "dropout": 0.0,
-        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.1, "mae_p_max": 0.1, "time_every": 4,
+        "n_heads": 4, "depth": 8, "dropout": 0.05,
+        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.0, "time_every": 4,
     }
     dec_kwargs = {
         "d_model": 64, "n_heads": 4, "n_patches": num_patches, "n_latents": enc_n_latents, "depth": 8,
-        "d_patch": D_patch, "dropout": 0.0, "time_every": 4,
+        "d_patch": D_patch, "dropout": 0.05, "time_every": 4,
     }
     packing_factor = 2
     n_s = enc_n_latents // packing_factor
@@ -401,7 +401,7 @@ if __name__ == "__main__":
     # ====== (C) Visualize the loaded dynamics policy ======
     try:
         ctx_length = 4
-        num_sampling_steps = 4
+        num_sampling_steps = 32
         visualize_dynamics_kwargs = {
             "encoder": encoder,
             "decoder": decoder,
@@ -438,7 +438,7 @@ if __name__ == "__main__":
         # convert them to uint8 and 255 range.
         grid = jnp.asarray(grid * 255.0, dtype=jnp.uint8)
         # save as gif
-        imageio.mimsave(run_dir / f"predictions.gif", grid)
+        imageio.mimsave(run_dir / f"predictions.gif", grid, loop=1000)
        
     finally:
         mngr.wait_until_finished()

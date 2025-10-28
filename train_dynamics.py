@@ -449,7 +449,8 @@ if __name__ == "__main__":
     enc_kwargs = {
         "d_model": 64, "n_latents": enc_n_latents, "n_patches": num_patches,
         "n_heads": 4, "depth": 8, "dropout": 0.05,
-        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.15, "time_every": 4,
+        "d_bottleneck": enc_d_bottleneck, "mae_p_min": 0.0, "mae_p_max": 0.0, # disable MAE for inference.
+         "time_every": 4,
     }
     packing_factor = 2
     n_s = enc_n_latents // packing_factor
@@ -514,9 +515,6 @@ if __name__ == "__main__":
         print(f"[dynamics] Restored checkpoint step={latest_step} from {ckpt_dir}")
 
     # ====== (C) Training loop with periodic save ======
-    from collections import deque
-    running_time_avg = deque(maxlen=10)
-
     try:
         for step in range(start_step, max_steps):
             data_start_t = time()
@@ -542,9 +540,5 @@ if __name__ == "__main__":
             state = make_state(params, opt_state, rng, step)
             maybe_save(mngr, step, state, meta)
 
-            # simple runtime smoothing
-            running_time_avg.append(train_t)
-            if step % 100 == 0:
-                print(f"running avg: {sum(running_time_avg)/len(running_time_avg):.3f}s")
     finally:
         mngr.wait_until_finished()
