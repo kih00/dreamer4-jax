@@ -248,6 +248,145 @@ def make_train_step(static_flags):
     return train_step
 
 # ---------------------------
+# Efficient training step (fused main forward)
+# ---------------------------
+
+@partial(
+    jax.jit,
+    static_argnames=("encoder","dynamics","tx","patch","n_s","k_max","packing_factor","B","T","B_self"),
+)
+def train_step_efficient(
+    encoder, dynamics, tx,
+    params, opt_state,
+    enc_vars, dyn_vars,
+    frames, actions,
+    *,
+    patch: int,
+    B: int, T: int, B_self: int,            # assume 0 < B_self < B
+    n_s: int, k_max: int, packing_factor: int,
+    master_key: jnp.ndarray, step: int,
+):
+    """
+    Deterministic two-branch training (one fused main forward):
+      - first B_emp rows: empirical flow at d_min = 1/k_max
+      - last  B_self rows: bootstrap self-consistency with d > d_min
+    Produces metrics aligned with the existing code: flow_mse and bootstrap_mse.
+    """
+    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
+    def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
+        B_, T_ = shape_bt
+        K = (1 << step_idx)                             # (B,T)
+        u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
+        j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)   # 0..K-1
+        tau = j_idx.astype(dtype) / K.astype(dtype)                 # (B,T)
+        tau_idx = j_idx * (k_max // K)                              # global grid index
+        return tau, tau_idx
+
+    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
+    def _sample_step_excluding_dmin(rng, shape_bt, k_max:int):
+        B_, T_ = shape_bt
+        emax = jnp.log2(k_max).astype(jnp.int32)
+        step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)  # exclude emax
+        d = 1.0 / (1 << step_idx).astype(jnp.float32)
+        return d, step_idx
+
+    # ---------- Param-free precompute ----------
+    patches_btnd = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
+
+    # RNGs
+    step_key = jax.random.fold_in(master_key, step)
+    enc_key, key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 5)
+
+    # Frozen encoder → bottleneck → spatial tokens (clean target z1)
+    z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
+    z1 = pack_bottleneck_to_spatial(z_bottleneck, n_s=n_s, k=packing_factor)  # (B,T,Sz,Dz)
+
+    # Deterministic batch split
+    B_emp  = B - B_self
+    actions_full = actions
+    emax = jnp.log2(k_max).astype(jnp.int32)  # exponent index for d_min
+
+    # --- Step indices (encode d) ---
+    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min for empirical rows
+    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)  # d > d_min for self rows
+    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
+
+    # --- Signal levels on each row's grid (one call for whole batch) ---
+    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), k_max, step_idx_full)
+    sigma_emp   = sigma_full[:B_emp]                   # (B_emp,T)
+    sigma_self  = sigma_full[B_emp:]                   # (B_self,T)
+    sigma_idx_self = sigma_idx_full[B_emp:]            # (B_self,T)
+
+    # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
+    z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
+    z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * z1
+    z_tilde_self = z_tilde_full[B_emp:]                # (B_self,T,Sz,Dz)
+
+    # --- Ramp weights w(sigma) ---
+    w_emp  = 0.9 * sigma_emp  + 0.1
+    w_self = 0.9 * sigma_self + 0.1
+
+    # --- Half-step metadata for self rows ---
+    d_half            = d_self / 2.0                                         # (B_self,T)
+    step_idx_half     = step_idx_self + 1                                    # halve step → double K
+    sigma_plus        = sigma_self + d_half                                  # σ + d/2
+    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)  # global grid shift
+
+    def loss_and_aux(p):
+        local_dyn = with_params(dyn_vars, p)
+        drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
+
+        # ---------- ONE fused main forward (emp + self) ----------
+        z1_hat_full = dynamics.apply(
+            local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
+            rngs={"dropout": drop_main}, deterministic=False,
+        )  # (B,T,Sz,Dz)
+
+        # Split outputs
+        z1_hat_emp  = z1_hat_full[:B_emp]     # (B_emp,T,Sz,Dz)
+        z1_hat_self = z1_hat_full[B_emp:]     # (B_self,T,Sz,Dz)
+
+        # ---------- Empirical flow loss (x-space MSE to z1 at d_min) ----------
+        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))        # (B_emp,T)
+        loss_emp = jnp.mean(flow_per * w_emp)
+
+        # ---------- Self-consistency (bootstrap) ----------
+        z1_hat_half1 = dynamics.apply(
+            local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
+            rngs={"dropout": drop_h1}, deterministic=False,
+        )
+        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+
+        z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+
+        z1_hat_half2 = dynamics.apply(
+            local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
+            rngs={"dropout": drop_h2}, deterministic=False,
+        )
+        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
+
+        vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+        vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
+
+        boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+        loss_self = jnp.mean(boot_per * w_self)
+
+        # ---------- Combine (row-weighted for full-batch mean) ----------
+        loss = ((loss_emp * B_emp) + (loss_self * B_self)) / B
+
+        # Metrics aligned with the non-efficient path
+        aux = {
+            "flow_mse": jnp.mean(flow_per),
+            "bootstrap_mse": jnp.mean(boot_per),
+        }
+        return loss, aux
+
+    (loss_val, aux), grads = jax.value_and_grad(loss_and_aux, has_aux=True)(params)
+    updates, opt_state = tx.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    return new_params, opt_state, aux
+
+# ---------------------------
 # Eval regimes & plan JSON
 # ---------------------------
 
@@ -343,6 +482,10 @@ class RealismConfig:
     multi_step_bins: bool = True
     use_bootstrap: bool = True
     bootstrap_start: int = 5_000  # warm-up steps with bootstrap disabled
+    # efficient training toggle (does flow @ d_min and bootstrap in one fused pass)
+    use_efficient_train_step: bool = True
+    # when using the efficient step, split the batch: B_emp = B - B_self, B_self = int(self_fraction * B)
+    self_fraction: float = 0.25
 
     # train
     max_steps: int = 50_000
@@ -350,7 +493,7 @@ class RealismConfig:
     lr: float = 3e-4
 
     # IO
-    run_name: str = "realism_streaming_nodelta"
+    run_name: str = "realism_streaming_efficient"
     tokenizer_ckpt: str = "/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints"
 
 # ---------------------------
@@ -457,6 +600,8 @@ def run_realism(cfg: RealismConfig):
     # Streaming RNGs
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
+    # For the efficient step
+    B_self = max(1, int(round(cfg.self_fraction * cfg.B))) if cfg.use_efficient_train_step else 0
 
     start_wall = time.time()
     for step in range(cfg.max_steps + 1):
@@ -470,16 +615,29 @@ def run_realism(cfg: RealismConfig):
         # Warm-up → no bootstrap; after bootstrap_start → enable
         use_boot_now = cfg.use_bootstrap and (step >= cfg.bootstrap_start)
 
-        params, opt_state, aux = train_step(
-            encoder, decoder, dynamics, tx,
-            params, opt_state, enc_vars, dec_vars, dyn_vars,
-            frames, actions,
-            patch=cfg.patch, n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
-            sigma_sampling=cfg.sigma_sampling,
-            multi_step_bins=cfg.multi_step_bins,
-            use_bootstrap=use_boot_now,
-            master_key=master_key,
-        )
+        if cfg.use_efficient_train_step and use_boot_now:
+            # fused pass (flow@d_min + bootstrap) for speed
+            params, opt_state, aux = train_step_efficient(
+                encoder, dynamics, tx,
+                params, opt_state,
+                enc_vars, dyn_vars,
+                frames, actions,
+                patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
+                n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
+                master_key=master_key, step=step,
+            )
+        else:
+            # original step (no bootstrap or warm-up)
+            params, opt_state, aux = train_step(
+                encoder, decoder, dynamics, tx,
+                params, opt_state, enc_vars, dec_vars, dyn_vars,
+                frames, actions,
+                patch=cfg.patch, n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
+                sigma_sampling=cfg.sigma_sampling,
+                multi_step_bins=cfg.multi_step_bins,
+                use_bootstrap=use_boot_now,
+                master_key=master_key,
+            )
 
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
             pieces = [f"[train] step={step:06d}",
@@ -538,7 +696,7 @@ def run_realism(cfg: RealismConfig):
                 mp4_path = tag_dir / f"{tag}_grid.mp4"
 
                 # Write GIF
-                imageio.mimsave(gif_path, grid_frames, duration=1/25, loop=1000)
+                # imageio.mimsave(gif_path, grid_frames, duration=1/25, loop=1000)
                 # Write MP4 (best-effort)
                 try:
                     with imageio.get_writer(mp4_path, fps=25, codec="libx264", quality=8) as w:

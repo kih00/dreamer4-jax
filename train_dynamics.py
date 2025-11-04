@@ -1,3 +1,5 @@
+# train_dynamics.py
+# contains older logic on training the dynamics model.
 from functools import partial
 import jax
 import jax.numpy as jnp

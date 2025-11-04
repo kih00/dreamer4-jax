@@ -689,14 +689,6 @@ def test_encoder_decoder():
     print(f"Warm-up (compile+run): {t1 - t0:.3f}s")
     print(f"Hot run (cached):      {t3 - t2:.3f}s")
 
-    # print(pred.shape) # should be (B,T,Np,D_patch)
-    # masked_pred = jnp.where(patch_mask, pred, 0.0)
-    # masked_target = jnp.where(patch_mask, patch_tokens_btnd, 0.0)
-    # num_masked = jnp.maximum(patch_mask.sum(), 1)
-    # recon_loss = jnp.sum((masked_pred - masked_target) ** 2) / num_masked
-    # print(recon_loss)
-    # import ipdb; ipdb.set_trace()
-
 def test_dynamics():
     rng = jax.random.PRNGKey(0)
     B = 2
