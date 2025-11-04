@@ -1,12 +1,12 @@
-# overfit_realism_experiments.py
+# train_realism_efficient.py
 # Streaming-batch "realism" training on synthetic data with TF training and AR evaluation.
-# k_max=8 with two bins {1/8, 1/4}; σ-sampling on; multi-bin on; bootstrap after warm-up.
-# Saves GT|FLOOR|PRED triptychs and a sampler plan JSON per visualization.
+# This version keeps ONLY the efficient training step and adds robust Orbax checkpointing.
+# It restores the pretrained tokenizer (enc/dec) and trains the dynamics model.
 
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Dict, Any
+from typing import Dict, Any
 from functools import partial
 import json
 import time
@@ -17,20 +17,22 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import imageio.v2 as imageio
-import orbax.checkpoint as ocp  # only used by tokenizer restore
+import orbax.checkpoint as ocp
 
 from models import Encoder, Decoder, Dynamics
 from data import make_iterator
 from utils import (
     temporal_patchify, temporal_unpatchify,
-    pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
-    make_state, make_manager, with_params, pack_mae_params,
+    pack_bottleneck_to_spatial,
+    with_params,
+    make_state, make_manager, try_restore, maybe_save,
+    pack_mae_params,
 )
 
 from sampler_unified import SamplerConfig, sample_video
 
 # ---------------------------
-# Utilities
+# Small helpers
 # ---------------------------
 
 def _ensure_dir(p: Path) -> Path:
@@ -43,39 +45,29 @@ def _to_uint8(img_f32):
 def _stack_wide(*imgs_hwC):
     return np.concatenate(imgs_hwC, axis=1)
 
-def psnr_from_mse(mse):
-    eps = 1e-12
-    return 10.0 * jnp.log10(1.0 / jnp.maximum(mse, eps))
-
 def _tile_triptychs(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
-    """
-    Given a list of per-sample triptychs (each Hx(3W)xC), tile into a grid image.
-    Returns a single H*rows x (3W)*ncols x C image.
-    """
     if len(trip_list_hwC) == 0:
         raise ValueError("Empty triptych list")
-
     H, W3, C = trip_list_hwC[0].shape
     B = len(trip_list_hwC)
     nrows = math.ceil(B / ncols)
-
-    # Pad with blanks if needed.
     total = nrows * ncols
     if total > B:
         blank = np.full((H, W3, C), pad_color, dtype=trip_list_hwC[0].dtype)
         trip_list_hwC = trip_list_hwC + [blank] * (total - B)
-
-    # Build rows
     rows = []
     idx = 0
     for _ in range(nrows):
         row_imgs = trip_list_hwC[idx:idx + ncols]
         idx += ncols
-        rows.append(np.concatenate(row_imgs, axis=1))  # concat across width
-    grid = np.concatenate(rows, axis=0)  # stack rows vertically
-    return grid  # (nrows*H, ncols*(3W), C)
+        rows.append(np.concatenate(row_imgs, axis=1))
+    grid = np.concatenate(rows, axis=0)
+    return grid
 
-# --- tokenizer ckpt restore (your orbax layout) ---
+# ---------------------------
+# Tokenizer restore (uses your Orbax layout & utils)
+# ---------------------------
+
 def load_pretrained_tokenizer(
     tokenizer_ckpt_dir: str,
     *,
@@ -123,132 +115,7 @@ def load_pretrained_tokenizer(
     return new_enc_vars, new_dec_vars, meta
 
 # ---------------------------
-# Training step (TF)
-# ---------------------------
-
-@jax.jit
-def _fixed_indices(z1_btSd, k_max: int):
-    B, T = z1_btSd.shape[:2]
-    emax = jnp.log2(jnp.asarray(k_max)).astype(jnp.int32)
-    step_idx = jnp.full((B, T), emax, dtype=jnp.int32)
-    sigma_val = 1.0 - (1.0 / k_max)
-    sigma = jnp.full((B, T), sigma_val, jnp.float32)
-    sigma_idx = (sigma * k_max).astype(jnp.int32)
-    return step_idx, sigma, sigma_idx
-
-@jax.jit
-def _sigma_sample_for_step(rng, k_max: int, step_idx_bt: jnp.ndarray):
-    K = (1 << step_idx_bt)  # (B,T)
-    u = jax.random.uniform(rng, step_idx_bt.shape, dtype=jnp.float32)
-    j_idx = jnp.floor(u * K.astype(jnp.float32)).astype(jnp.int32)   # 0..K-1
-    sigma = j_idx.astype(jnp.float32) / K.astype(jnp.float32)        # in {0..(K-1)}/K
-    sigma_idx = j_idx * (k_max // K)                                  # map to global bins
-    return sigma, sigma_idx
-
-@jax.jit
-def _choose_step_bins(rng, k_max: int, template_bt: jnp.ndarray):
-    emax = jnp.log2(jnp.asarray(k_max)).astype(jnp.int32)
-    step_lo = jnp.maximum(emax - 1, 0)  # emax-1
-    step_hi = emax                      # emax
-    coin = jax.random.bernoulli(rng, 0.5, template_bt.shape)
-    return jnp.where(coin, step_lo, step_hi).astype(jnp.int32)
-
-def make_train_step(static_flags):
-    @partial(
-        jax.jit,
-        static_argnames=(
-            "encoder","decoder","dynamics","tx",
-            "patch","n_s","k_max","packing_factor",
-            "sigma_sampling","multi_step_bins","use_bootstrap",
-        ),
-    )
-    def train_step(
-        encoder, decoder, dynamics, tx,
-        params, opt_state,
-        enc_vars, dec_vars, dyn_vars,
-        frames, actions,
-        *,
-        patch, n_s, k_max, packing_factor,
-        sigma_sampling: bool,
-        multi_step_bins: bool,
-        use_bootstrap: bool,
-        master_key: jnp.ndarray,
-    ):
-        patches_btnd = temporal_patchify(frames, patch)
-
-        key_enc, key_noise, key_sigma, key_step, key_drop = jax.random.split(master_key, 5)
-
-        # Encode (frozen)
-        z_btLd, _ = encoder.apply(
-            enc_vars, patches_btnd, rngs={"mae": key_enc}, deterministic=True
-        )
-        z1 = pack_bottleneck_to_spatial(z_btLd, n_s=n_s, k=packing_factor)  # (B,T,Ns,Ds)
-
-        # Step / sigma bins
-        if multi_step_bins:
-            step_idx_full = _choose_step_bins(key_step, k_max, z1[:, :, 0, 0])
-        else:
-            step_idx_full, _, _ = _fixed_indices(z1, k_max)
-
-        if sigma_sampling:
-            sigma_full, sigma_idx_full = _sigma_sample_for_step(key_sigma, k_max, step_idx_full)
-        else:
-            _, sigma_full, sigma_idx_full = _fixed_indices(z1, k_max)
-
-        # Corrupt
-        z0 = jax.random.normal(key_noise, z1.shape, dtype=z1.dtype)
-        z_tilde = (1.0 - sigma_full)[..., None, None] * z0 + sigma_full[..., None, None] * z1
-
-        def loss_and_metrics(p):
-            local_dyn = {"params": p, **{k:v for k,v in dyn_vars.items() if k != "params"}}
-
-            # Main TF prediction
-            z1_hat = dynamics.apply(
-                local_dyn, actions, step_idx_full, sigma_idx_full, z_tilde,
-                rngs={"dropout": key_drop}, deterministic=False
-            )
-            flow_per = jnp.mean((z1_hat - z1) ** 2, axis=(2,3))
-            flow_mse = jnp.mean(flow_per)
-            loss = flow_mse
-            aux = {"flow_mse": flow_mse}
-
-            # Optional bootstrap (two half-steps)
-            if use_bootstrap:
-                d = 1.0 / (1 << step_idx_full).astype(jnp.float32)  # 1/2^e
-                d_half = d / 2.0
-                emax = jnp.log2(k_max).astype(jnp.int32)
-                step_idx_half = jnp.clip(step_idx_full + 1, 0, emax)
-
-                sigma_plus = jnp.clip(sigma_full + d_half, 0.0, 1.0 - (1.0 / k_max))
-                sigma_idx_self = sigma_idx_full
-                sigma_idx_plus = jnp.floor(sigma_plus * k_max).astype(jnp.int32)
-
-                z1_hat_h1 = dynamics.apply(local_dyn, actions, step_idx_half, sigma_idx_self, z_tilde, deterministic=False)
-                b_prime = (z1_hat_h1 - z_tilde) / jnp.maximum(1.0 - sigma_full, 1e-6)[..., None, None]
-
-                z_prime = z_tilde + b_prime * d_half[..., None, None]
-                z1_hat_h2 = dynamics.apply(local_dyn, actions, step_idx_half, sigma_idx_plus, z_prime, deterministic=False)
-                b_doubleprime = (z1_hat_h2 - z_prime) / jnp.maximum(1.0 - sigma_plus, 1e-6)[..., None, None]
-
-                vhat_sigma = (z1_hat - z_tilde) / jnp.maximum(1.0 - sigma_full, 1e-6)[..., None, None]
-                vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-
-                boot_per = (1.0 - sigma_full)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))
-                boot_mse = jnp.mean(boot_per)
-                aux["bootstrap_mse"] = boot_mse
-                loss = loss + boot_mse
-
-            return loss, aux
-
-        (loss_val, aux), grads = jax.value_and_grad(loss_and_metrics, has_aux=True)(params)
-        updates, opt_state = tx.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, opt_state, aux
-
-    return train_step
-
-# ---------------------------
-# Efficient training step (fused main forward)
+# Single efficient training step (always used)
 # ---------------------------
 
 @partial(
@@ -262,24 +129,25 @@ def train_step_efficient(
     frames, actions,
     *,
     patch: int,
-    B: int, T: int, B_self: int,            # assume 0 < B_self < B
+    B: int, T: int, B_self: int,            # assume 0 <= B_self < B
     n_s: int, k_max: int, packing_factor: int,
-    master_key: jnp.ndarray, step: int,
+    master_key: jnp.ndarray, step: int, bootstrap_start: int,
 ):
     """
     Deterministic two-branch training (one fused main forward):
       - first B_emp rows: empirical flow at d_min = 1/k_max
       - last  B_self rows: bootstrap self-consistency with d > d_min
-    Produces metrics aligned with the existing code: flow_mse and bootstrap_mse.
+    If step < bootstrap_start, the bootstrap contribution is masked to 0 (but we still
+    execute one fused path to keep a single jit and stable shapes).
     """
     @partial(jax.jit, static_argnames=("shape_bt","k_max",))
     def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
         B_, T_ = shape_bt
-        K = (1 << step_idx)                             # (B,T)
+        K = (1 << step_idx)
         u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
-        j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)   # 0..K-1
-        tau = j_idx.astype(dtype) / K.astype(dtype)                 # (B,T)
-        tau_idx = j_idx * (k_max // K)                              # global grid index
+        j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
+        tau = j_idx.astype(dtype) / K.astype(dtype)
+        tau_idx = j_idx * (k_max // K)
         return tau, tau_idx
 
     @partial(jax.jit, static_argnames=("shape_bt","k_max",))
@@ -291,93 +159,99 @@ def train_step_efficient(
         return d, step_idx
 
     # ---------- Param-free precompute ----------
-    patches_btnd = temporal_patchify(frames, patch)  # (B,T,Np,Dp)
+    patches_btnd = temporal_patchify(frames, patch)
 
     # RNGs
     step_key = jax.random.fold_in(master_key, step)
     enc_key, key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 5)
 
-    # Frozen encoder → bottleneck → spatial tokens (clean target z1)
+    # Frozen encoder → spatial tokens (clean target z1)
     z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_bottleneck, n_s=n_s, k=packing_factor)  # (B,T,Sz,Dz)
 
     # Deterministic batch split
     B_emp  = B - B_self
     actions_full = actions
-    emax = jnp.log2(k_max).astype(jnp.int32)  # exponent index for d_min
+    emax = jnp.log2(k_max).astype(jnp.int32)
 
     # --- Step indices (encode d) ---
-    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min for empirical rows
-    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)  # d > d_min for self rows
+    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min
+    # If B_self == 0, create a dummy 0xT array – slicing below handles it.
+    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)
     step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
 
     # --- Signal levels on each row's grid (one call for whole batch) ---
     sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), k_max, step_idx_full)
-    sigma_emp   = sigma_full[:B_emp]                   # (B_emp,T)
-    sigma_self  = sigma_full[B_emp:]                   # (B_self,T)
-    sigma_idx_self = sigma_idx_full[B_emp:]            # (B_self,T)
+    sigma_emp   = sigma_full[:B_emp]
+    sigma_self  = sigma_full[B_emp:]
+    sigma_idx_self = sigma_idx_full[B_emp:]
 
     # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
     z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
     z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * z1
-    z_tilde_self = z_tilde_full[B_emp:]                # (B_self,T,Sz,Dz)
+    z_tilde_self = z_tilde_full[B_emp:]
 
-    # --- Ramp weights w(sigma) ---
+    # --- Ramp weights ---
     w_emp  = 0.9 * sigma_emp  + 0.1
     w_self = 0.9 * sigma_self + 0.1
 
     # --- Half-step metadata for self rows ---
-    d_half            = d_self / 2.0                                         # (B_self,T)
-    step_idx_half     = step_idx_self + 1                                    # halve step → double K
-    sigma_plus        = sigma_self + d_half                                  # σ + d/2
-    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)  # global grid shift
+    d_half            = d_self / 2.0
+    step_idx_half     = step_idx_self + 1
+    sigma_plus        = sigma_self + d_half
+    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
 
     def loss_and_aux(p):
         local_dyn = with_params(dyn_vars, p)
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
-        # ---------- ONE fused main forward (emp + self) ----------
+        # Main forward (emp + self)
         z1_hat_full = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
             rngs={"dropout": drop_main}, deterministic=False,
         )  # (B,T,Sz,Dz)
 
-        # Split outputs
-        z1_hat_emp  = z1_hat_full[:B_emp]     # (B_emp,T,Sz,Dz)
-        z1_hat_self = z1_hat_full[B_emp:]     # (B_self,T,Sz,Dz)
+        z1_hat_emp  = z1_hat_full[:B_emp]
+        z1_hat_self = z1_hat_full[B_emp:]
 
-        # ---------- Empirical flow loss (x-space MSE to z1 at d_min) ----------
+        # Flow loss on empirical rows (to z1)
         flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))        # (B_emp,T)
         loss_emp = jnp.mean(flow_per * w_emp)
 
-        # ---------- Self-consistency (bootstrap) ----------
-        z1_hat_half1 = dynamics.apply(
-            local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
-            rngs={"dropout": drop_h1}, deterministic=False,
+        # Self-consistency (bootstrap) on self rows
+        # If B_self == 0, shapes are 0-sized and reductions become NaN; guard with mask.
+        do_boot = (B_self > 0) & (step >= bootstrap_start)
+
+        def _boot_loss():
+            z1_hat_half1 = dynamics.apply(
+                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
+                rngs={"dropout": drop_h1}, deterministic=False,
+            )
+            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+            z1_hat_half2 = dynamics.apply(
+                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
+                rngs={"dropout": drop_h2}, deterministic=False,
+            )
+            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
+            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
+            boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+            loss_self = jnp.mean(boot_per * w_self)
+            return loss_self, jnp.mean(boot_per)
+
+        loss_self, boot_mse = jax.lax.cond(
+            do_boot,
+            _boot_loss,
+            lambda: (jnp.array(0.0, dtype=z1.dtype), jnp.array(0.0, dtype=z1.dtype)),
         )
-        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
 
-        z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+        # Combine (row-weighted by nominal B parts; denominator B keeps scale constant)
+        loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
 
-        z1_hat_half2 = dynamics.apply(
-            local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
-            rngs={"dropout": drop_h2}, deterministic=False,
-        )
-        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
-
-        vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
-        vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-
-        boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
-        loss_self = jnp.mean(boot_per * w_self)
-
-        # ---------- Combine (row-weighted for full-batch mean) ----------
-        loss = ((loss_emp * B_emp) + (loss_self * B_self)) / B
-
-        # Metrics aligned with the non-efficient path
         aux = {
             "flow_mse": jnp.mean(flow_per),
-            "bootstrap_mse": jnp.mean(boot_per),
+            "bootstrap_mse": boot_mse,
         }
         return loss, aux
 
@@ -387,20 +261,19 @@ def train_step_efficient(
     return new_params, opt_state, aux
 
 # ---------------------------
-# Eval regimes & plan JSON
+# Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
 def _eval_regimes_for_realism(cfg, *, ctx_length: int) -> list[tuple[str, SamplerConfig]]:
-    # Always eval finest AR; also eval shortcut_d4 AR (k_max=8 -> d=1/4)
     common = dict(
         k_max=cfg.k_max,
         horizon=min(32, cfg.T - ctx_length),
         ctx_length=ctx_length,
-        ctx_signal_tau=0.99,  # slight robustness noise during AR eval
+        ctx_signal_tau=0.99,
         H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
         n_s=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
-        start_mode="pure",  # AR requires pure
+        start_mode="pure",
         rollout="autoregressive",
     )
     regs: list[tuple[str, SamplerConfig]] = []
@@ -409,7 +282,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int) -> list[tuple[str, Sample
     return regs
 
 def _plan_from_sconf(s: SamplerConfig) -> Dict[str, Any]:
-    # Recompute the scheduling descriptors for JSON (mirrors unified sampler logic)
     def _is_pow2_frac(x: float) -> bool:
         if x <= 0 or x > 1: return False
         inv = round(1.0 / x)
@@ -424,12 +296,11 @@ def _plan_from_sconf(s: SamplerConfig) -> Dict[str, Any]:
             raise ValueError("d finer than finest")
         d = float(s.d)
 
-    tau0 = 0.0  # AR-pure
+    tau0 = 0.0
     S = int(round((1.0 - tau0) / d))
     e = int(round(np.log2(round(1.0 / d))))
     tau_seq = [round(tau0 + i*d, 6) for i in range(S + 1)]
     tau_seq[-1] = 1.0
-
     return dict(
         rollout=s.rollout,
         start_mode=s.start_mode,
@@ -476,33 +347,66 @@ class RealismConfig:
     packing_factor: int = 2
     n_r: int = 4
 
-    # schedule (realism): k_max=8; use σ-sampling + two bins {e=2,3}; bootstrap after warm-up
+    # schedule
     k_max: int = 8
-    sigma_sampling: bool = True
-    multi_step_bins: bool = True
-    use_bootstrap: bool = True
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap disabled
-    # efficient training toggle (does flow @ d_min and bootstrap in one fused pass)
-    use_efficient_train_step: bool = True
-    # when using the efficient step, split the batch: B_emp = B - B_self, B_self = int(self_fraction * B)
-    self_fraction: float = 0.25
+    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
+    self_fraction: float = 0.25   # used once we pass bootstrap_start
 
     # train
     max_steps: int = 50_000
     log_every: int = 1_000
     lr: float = 3e-4
 
-    # IO
+    # IO / ckpt
     run_name: str = "realism_streaming_efficient"
     tokenizer_ckpt: str = "/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints"
+    log_dir: str = "./logs"
+    ckpt_max_to_keep: int = 5
+    ckpt_save_every: int = 5_000
+
+    # eval media toggle
+    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
 
 # ---------------------------
-# Main training loop
+# Meta for dynamics checkpoints
 # ---------------------------
 
-def run_realism(cfg: RealismConfig):
-    out_dir = _ensure_dir(Path("./overfit_exps") / cfg.run_name)
-    print(f"[setup] writing artifacts to: {out_dir.resolve()}")
+def make_dynamics_meta(
+    *,
+    enc_kwargs: dict,
+    dec_kwargs: dict,
+    dynamics_kwargs: dict,
+    H: int, W: int, C: int,
+    patch: int,
+    k_max: int,
+    packing_factor: int,
+    n_s: int,
+    tokenizer_ckpt_dir: str | None = None,
+    cfg: Dict[str, Any] | None = None,
+):
+    return {
+        "enc_kwargs": enc_kwargs,
+        "dec_kwargs": dec_kwargs,
+        "dynamics_kwargs": dynamics_kwargs,
+        "H": H, "W": W, "C": C, "patch": patch,
+        "k_max": k_max,
+        "packing_factor": packing_factor,
+        "n_s": n_s,
+        "tokenizer_ckpt_dir": tokenizer_ckpt_dir,
+        "cfg": cfg or {},
+    }
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def run(cfg: RealismConfig):
+    # Output dirs
+    root = _ensure_dir(Path(cfg.log_dir))
+    run_dir = _ensure_dir(root / cfg.run_name)
+    ckpt_dir = _ensure_dir(run_dir / "checkpoints")
+    vis_dir = _ensure_dir(run_dir / "viz")
+    print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
     # Data iterator (streaming)
     next_batch = make_iterator(
@@ -567,7 +471,7 @@ def run_realism(cfg: RealismConfig):
     fake_z = jnp.zeros((cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
     dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
 
-    # Restore tokenizer params
+    # Restore tokenizer
     enc_vars, dec_vars, _ = load_pretrained_tokenizer(
         cfg.tokenizer_ckpt, rng=rng,
         encoder=encoder, decoder=decoder,
@@ -575,9 +479,8 @@ def run_realism(cfg: RealismConfig):
         sample_patches_btnd=patches_btnd,
     )
 
-    mae_eval_key = jax.random.PRNGKey(777)
-
     # Build initial z1 to shape dynamics init
+    mae_eval_key = jax.random.PRNGKey(777)
     z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
     z1 = pack_bottleneck_to_spatial(z_btLd, n_s=n_s, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
@@ -589,68 +492,78 @@ def run_realism(cfg: RealismConfig):
     tx = optax.adam(cfg.lr)
     opt_state = tx.init(params)
 
-    # Build train_step with static flags
-    train_step = make_train_step(dict(
-        sigma_sampling=cfg.sigma_sampling,
-        multi_step_bins=cfg.multi_step_bins,
-        use_bootstrap=cfg.use_bootstrap,
-        patch=cfg.patch, n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
-    ))
+    # -------- Orbax manager & (optional) restore --------
+    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
+    meta = make_dynamics_meta(
+        enc_kwargs=enc_kwargs,
+        dec_kwargs=dec_kwargs,
+        dynamics_kwargs=dyn_kwargs,
+        H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
+        k_max=k_max, packing_factor=cfg.packing_factor, n_s=n_s,
+        tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
+        cfg=asdict(cfg),
+    )
 
-    # Streaming RNGs
+    state_example = make_state(params, opt_state, rng, step=0)
+    restored = try_restore(mngr, state_example, meta)
+
+    start_step = 0
+    if restored is not None:
+        latest_step, r = restored
+        params     = r.state["params"]
+        opt_state  = r.state["opt_state"]
+        rng        = r.state["rng"]
+        start_step = int(r.state["step"]) + 1
+        dyn_vars = with_params(dyn_vars, params)
+        print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
+
+    # -------- Training loop --------
     train_rng = jax.random.PRNGKey(2025)
     data_rng = jax.random.PRNGKey(12345)
-    # For the efficient step
-    B_self = max(1, int(round(cfg.self_fraction * cfg.B))) if cfg.use_efficient_train_step else 0
 
     start_wall = time.time()
-    for step in range(cfg.max_steps + 1):
-        # Stream a fresh batch
+    for step in range(start_step, cfg.max_steps + 1):
+        # Data
         data_rng, batch_key = jax.random.split(data_rng)
         _, (frames, actions) = next_batch(batch_key)
 
-        # Split master rng
+        # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
 
-        # Warm-up → no bootstrap; after bootstrap_start → enable
-        use_boot_now = cfg.use_bootstrap and (step >= cfg.bootstrap_start)
+        # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
+        # and gate its contribution inside the jit via bootstrap_start masking).
+        B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
 
-        if cfg.use_efficient_train_step and use_boot_now:
-            # fused pass (flow@d_min + bootstrap) for speed
-            params, opt_state, aux = train_step_efficient(
-                encoder, dynamics, tx,
-                params, opt_state,
-                enc_vars, dyn_vars,
-                frames, actions,
-                patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
-                n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
-                master_key=master_key, step=step,
-            )
-        else:
-            # original step (no bootstrap or warm-up)
-            params, opt_state, aux = train_step(
-                encoder, decoder, dynamics, tx,
-                params, opt_state, enc_vars, dec_vars, dyn_vars,
-                frames, actions,
-                patch=cfg.patch, n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
-                sigma_sampling=cfg.sigma_sampling,
-                multi_step_bins=cfg.multi_step_bins,
-                use_bootstrap=use_boot_now,
-                master_key=master_key,
-            )
+        train_step_start_time = time.time()
+        params, opt_state, aux = train_step_efficient(
+            encoder, dynamics, tx,
+            params, opt_state,
+            enc_vars, dyn_vars,
+            frames, actions,
+            patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
+            n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
+            master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
+        )
 
+        # Logging
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
-            pieces = [f"[train] step={step:06d}",
-                      f"flow_mse={float(aux['flow_mse']):.6g}",
-                      f"t={time.time()-start_wall:.1f}s"]
-            if use_boot_now and "bootstrap_mse" in aux:
-                pieces.append(f"boot_mse={float(aux['bootstrap_mse']):.6g}")
+            pieces = [
+                f"[train] step={step:06d}",
+                f"flow_mse={float(aux['flow_mse']):.6g}",
+                f"boot_mse={float(aux['bootstrap_mse']):.6g}",
+                f"t={time.time()-train_step_start_time:.4f}s",
+                f"total_t={time.time()-start_wall:.1f}s",
+            ]
             print(" | ".join(pieces))
 
-            # === Eval (AR) on a held-out batch ===
+        # Save (async) when policy says we should
+        state = make_state(params, opt_state, train_rng, step)
+        maybe_save(mngr, step, state, meta)
+
+        # Periodic lightweight AR eval + media (optional)
+        if cfg.write_video_every and (step % cfg.write_video_every == 0):
             val_rng = jax.random.PRNGKey(9999)
             _, (val_frames, val_actions) = next_batch(val_rng)
-
             dyn_vars_eval = with_params(dyn_vars, params)
             ctx_length = min(32, cfg.T - 1)
             regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
@@ -658,7 +571,6 @@ def run_realism(cfg: RealismConfig):
             for tag, sconf in regimes:
                 sconf.mae_eval_key = mae_eval_key
                 sconf.rng_key = jax.random.PRNGKey(4242)
-
                 t0 = time.time()
                 pred_frames, floor_frames, gt_frames = sample_video(
                     encoder=encoder, decoder=decoder, dynamics=dynamics,
@@ -666,19 +578,16 @@ def run_realism(cfg: RealismConfig):
                     frames=val_frames, actions=val_actions, config=sconf,
                 )
                 dt = time.time() - t0
-
                 HZ = sconf.horizon
                 mse = jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2)
-                psnr = psnr_from_mse(mse)
+                psnr = 10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12))
                 print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={float(mse):.6g} | PSNR={float(psnr):.2f} dB | {dt:.2f}s")
 
-                # === Visualization: grid over entire batch ===
-                # Convert to uint8 on host
-                gt_np_all    = _to_uint8(gt_frames)      # (B, ctx+HZ, H, W, C)
-                floor_np_all = _to_uint8(floor_frames)   # (B, ctx+HZ, H, W, C)
-                pred_np_all  = _to_uint8(pred_frames)    # (B, ctx+HZ, H, W, C)
+                # Build tiled video over batch
+                gt_np_all    = _to_uint8(gt_frames)
+                floor_np_all = _to_uint8(floor_frames)
+                pred_np_all  = _to_uint8(pred_frames)
 
-                # Build triptych per sample per timestep and tile into frames
                 T_total = gt_np_all.shape[1]
                 ncols = 1 if cfg.B <= 2 else min(2, cfg.B)
                 grid_frames = []
@@ -690,22 +599,15 @@ def run_realism(cfg: RealismConfig):
                     grid_img = _tile_triptychs(trip_list, ncols=ncols, pad_color=0)
                     grid_frames.append(grid_img)
 
-                # Paths
-                tag_dir = _ensure_dir(out_dir / f"step_{step:06d}")
-                gif_path = tag_dir / f"{tag}_grid.gif"
+                tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
                 mp4_path = tag_dir / f"{tag}_grid.mp4"
-
-                # Write GIF
-                # imageio.mimsave(gif_path, grid_frames, duration=1/25, loop=1000)
-                # Write MP4 (best-effort)
                 try:
                     with imageio.get_writer(mp4_path, fps=25, codec="libx264", quality=8) as w:
                         for fr in grid_frames:
                             w.append_data(fr)
                 except Exception as e:
-                    print(f"[eval:{tag}] MP4 write skipped ({e}); GIF saved.")
+                    print(f"[eval:{tag}] MP4 write skipped ({e})")
 
-                # Dump a sampler plan JSON next to the media
                 plan = _plan_from_sconf(sconf)
                 plan["step"] = int(step)
                 plan["mse"] = float(mse)
@@ -713,19 +615,16 @@ def run_realism(cfg: RealismConfig):
                 plan_path = tag_dir / f"{tag}_plan.json"
                 with open(plan_path, "w") as f:
                     json.dump(plan, f, indent=2)
+                print(f"[eval:{tag}] wrote {mp4_path.name} and {plan_path.name} in {tag_dir}")
 
-                print(f"[eval:{tag}] wrote {gif_path.name}, "
-                      f"{mp4_path.name if mp4_path.exists() else '(gif only)'}, "
-                      f"and {plan_path.name} in {tag_dir}")
+    # Ensure all writes finished
+    mngr.wait_until_finished()
 
-    # Save final config used
-    (out_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
+    # Save final config
+    (run_dir / "config.txt").write_text("\n".join([f"{k}={v}" for k, v in asdict(cfg).items()]))
 
-# ---------------------------
-# Entrypoint
-# ---------------------------
 
 if __name__ == "__main__":
     cfg = RealismConfig()
-    print(f"Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
-    run_realism(cfg)
+    print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
+    run(cfg)
