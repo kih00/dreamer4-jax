@@ -87,8 +87,8 @@ class RealismConfig:
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
     # train
-    max_steps: int = 50_000
-    log_every: int = 1_000
+    max_steps: int = 1_000_000_000
+    log_every: int = 5_000
     lr: float = 3e-4
 
     # eval media toggle
@@ -859,11 +859,17 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="test_wandb_run_fixvideo", 
+        run_name="train_dynamics", 
         tokenizer_ckpt="/home/edward/projects/tiny_dreamer_4/logs/test/checkpoints",
         use_wandb=True,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
+        max_steps=1_000_000_000,
+        log_every=5_000,
+        lr=1e-4,
+        write_video_every=10_000,
+        ckpt_save_every=10_000,
+        ckpt_max_to_keep=2,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
