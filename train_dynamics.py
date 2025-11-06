@@ -327,22 +327,25 @@ def train_step_efficient(
 # Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
-def _eval_regimes_for_realism(cfg, *, ctx_length: int) -> list[tuple[str, SamplerConfig]]:
+def _eval_regimes_for_realism(cfg, *, ctx_length: int):
     common = dict(
         k_max=cfg.k_max,
         horizon=min(32, cfg.T - ctx_length),
         ctx_length=ctx_length,
-        ctx_signal_tau=0.99,
+        ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
         n_s=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
         start_mode="pure",
         rollout="autoregressive",
+        # optional: see item 3 below
+        # match_ctx_tau=False,
     )
-    regs: list[tuple[str, SamplerConfig]] = []
+    regs = []
     regs.append(("finest_pure_AR", SamplerConfig(schedule="finest", **common)))
     regs.append(("shortcut_d4_pure_AR", SamplerConfig(schedule="shortcut", d=1/4, **common)))
     return regs
+
 
 def _plan_from_sampler_conf(s: SamplerConfig) -> Dict[str, Any]:
     def _is_pow2_frac(x: float) -> bool:
