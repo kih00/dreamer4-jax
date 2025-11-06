@@ -56,8 +56,8 @@ class RealismConfig:
     wandb_project: str | None = None  # if None, uses run_name as project
 
     # data
-    B: int = 64
-    T: int = 64
+    B: int = 4
+    T: int = 8
     H: int = 32
     W: int = 32
     C: int = 3
@@ -68,7 +68,7 @@ class RealismConfig:
     hold_max: int = 9
     diversify_data: bool = True
 
-    # tokenizer / dynamics sizes
+    # tokenizer / dynamics config
     patch: int = 4
     enc_n_latents: int = 16
     enc_d_bottleneck: int = 32
@@ -79,7 +79,9 @@ class RealismConfig:
     dyn_depth: int = 8
     n_heads: int = 4
     packing_factor: int = 2
-    n_r: int = 4 # number of register tokens for dynamics
+    n_register: int = 4 # number of register tokens for dynamics
+    n_agent: int = 1 # number of agent tokens for dynamics
+    agent_space_mode: str = "wm_agent_isolated"
 
     # schedule
     k_max: int = 8
@@ -183,7 +185,7 @@ def load_pretrained_tokenizer(
 
 @partial(
     jax.jit,
-    static_argnames=("encoder","dynamics","tx","patch","n_s","k_max","packing_factor","B","T","B_self"),
+    static_argnames=("encoder","dynamics","tx","patch","n_spatial","k_max","packing_factor","B","T","B_self"),
 )
 def train_step_efficient(
     encoder, dynamics, tx,
@@ -193,7 +195,7 @@ def train_step_efficient(
     *,
     patch: int,
     B: int, T: int, B_self: int,            # assume 0 <= B_self < B
-    n_s: int, k_max: int, packing_factor: int,
+    n_spatial: int, k_max: int, packing_factor: int,
     master_key: jnp.ndarray, step: int, bootstrap_start: int,
 ):
     """
@@ -230,7 +232,7 @@ def train_step_efficient(
 
     # Frozen encoder → spatial tokens (clean target z1)
     z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_bottleneck, n_s=n_s, k=packing_factor)  # (B,T,Sz,Dz)
+    z1 = pack_bottleneck_to_spatial(z_bottleneck, n_spatial=n_spatial, k=packing_factor)  # (B,T,Sz,Dz)
 
     # Deterministic batch split
     B_emp  = B - B_self
@@ -269,7 +271,7 @@ def train_step_efficient(
         drop_main, drop_h1, drop_h2 = jax.random.split(drop_key, 3)
 
         # Main forward (emp + self)
-        z1_hat_full = dynamics.apply(
+        z1_hat_full, _ = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
             rngs={"dropout": drop_main}, deterministic=False,
         )  # (B,T,Sz,Dz)
@@ -286,13 +288,13 @@ def train_step_efficient(
         do_boot = (B_self > 0) & (step >= bootstrap_start)
 
         def _boot_loss():
-            z1_hat_half1 = dynamics.apply(
+            z1_hat_half1, _ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
                 rngs={"dropout": drop_h1}, deterministic=False,
             )
             b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
             z_prime = z_tilde_self + b_prime * d_half[...,None,None]
-            z1_hat_half2 = dynamics.apply(
+            z1_hat_half2, _ = dynamics.apply(
                 local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
                 rngs={"dropout": drop_h2}, deterministic=False,
             )
@@ -334,7 +336,7 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
-        n_s=cfg.enc_n_latents // cfg.packing_factor,
+        n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
         start_mode="pure",
         rollout="autoregressive",
@@ -487,7 +489,7 @@ def make_dynamics_meta(
     patch: int,
     k_max: int,
     packing_factor: int,
-    n_s: int,
+    n_spatial: int,
     tokenizer_ckpt_dir: str | None = None,
     cfg: Dict[str, Any] | None = None,
 ):
@@ -498,7 +500,7 @@ def make_dynamics_meta(
         "H": H, "W": W, "C": C, "patch": patch,
         "k_max": k_max,
         "packing_factor": packing_factor,
-        "n_s": n_s,
+        "n_spatial": n_spatial,
         "tokenizer_ckpt_dir": tokenizer_ckpt_dir,
         "cfg": cfg or {},
     }
@@ -565,15 +567,16 @@ def initialize_models_and_tokenizer(
         dropout=0.0,
         mlp_ratio=4.0, time_every=4, latents_only_time=True,
     )
-    n_s = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
+    n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
         d_model=cfg.d_model_dyn,
         d_bottleneck=cfg.enc_d_bottleneck,
         d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
-        n_s=n_s, n_r=cfg.n_r,
+        n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=cfg.n_heads, depth=cfg.dyn_depth,
-        dropout=0.0, k_max=k_max,
-        time_every=4, latents_only_time=False,
+        space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
+        dropout=0.0, k_max=k_max, 
+        time_every=4,
     )
 
     encoder = Encoder(**enc_kwargs)
@@ -597,7 +600,7 @@ def initialize_models_and_tokenizer(
     # Build initial z1 to shape dynamics init
     mae_eval_key = jax.random.PRNGKey(777)
     z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_s=n_s, k=cfg.packing_factor)
+    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
     emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
     sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
@@ -752,7 +755,7 @@ def run(cfg: RealismConfig):
     # Extract some values for checkpointing
     patch = cfg.patch
     k_max = cfg.k_max
-    n_s = cfg.enc_n_latents // cfg.packing_factor
+    n_spatial = cfg.enc_n_latents // cfg.packing_factor
 
     # -------- Orbax manager & (optional) restore --------
     mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
@@ -761,7 +764,7 @@ def run(cfg: RealismConfig):
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
         H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
-        k_max=k_max, packing_factor=cfg.packing_factor, n_s=n_s,
+        k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
     )
@@ -804,7 +807,7 @@ def run(cfg: RealismConfig):
             train_state.enc_vars, train_state.dyn_vars,
             frames, actions,
             patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
-            n_s=n_s, k_max=k_max, packing_factor=cfg.packing_factor,
+            n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
             master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
         )
 
@@ -872,7 +875,7 @@ if __name__ == "__main__":
         log_every=5_000,
         lr=1e-4,
         write_video_every=100_000,
-        ckpt_save_every=100_000,
+        ckpt_save_every=1_000,
         ckpt_max_to_keep=2,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))

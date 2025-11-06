@@ -39,7 +39,7 @@ class SamplerConfig:
     # decoding sizes
     H: int = 32; W: int = 32; C: int = 3; patch: int = 4
     # tokenizer shapes
-    n_s: int = 8
+    n_spatial: int = 8
     packing_factor: int = 2
     # debugging (host-side only)
     debug: bool = False
@@ -169,14 +169,14 @@ def denoise_single_latent(
     dyn_vars: Dict[str, Any],
     actions_ctx: jnp.ndarray,     # (B, T_ctx)
     action_curr: jnp.ndarray,     # (B, 1)
-    z_ctx_clean: jnp.ndarray,     # (B, T_ctx, N_s, D_s) clean context
-    z_t_init: jnp.ndarray,        # (B, 1, N_s, D_s) initial latent at tau0
+    z_ctx_clean: jnp.ndarray,     # (B, T_ctx, n_spatial, D_s) clean context
+    z_t_init: jnp.ndarray,        # (B, 1, n_spatial, D_s) initial latent at tau0
     k_max: int,
     d: float,
     start_mode: StartMode,
     tau0_fixed: float,
     rng_key: jax.Array,
-    clean_target_next: Optional[jnp.ndarray],  # (B,1,N_s,D_s) if TF else None
+    clean_target_next: Optional[jnp.ndarray],  # (B,1,n_spatial,D_s) if TF else None
     match_ctx_tau: bool = False,
 ) -> jnp.ndarray:
     """
@@ -184,7 +184,7 @@ def denoise_single_latent(
       - Uses adaptive mixing α = (τ_{s+1} − τ_s) / (1 − τ_s)
       - If match_ctx_tau=True, corrupt context to current τ at each step using a fixed z0_ctx
     """
-    B, T_ctx, N_s, D_s = z_ctx_clean.shape
+    B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
     _assert_power_of_two(k_max)
     assert actions_ctx.shape == (B, T_ctx)
     assert action_curr.shape == (B, 1)
@@ -224,13 +224,13 @@ def denoise_single_latent(
             z_ctx_tau = z_ctx_clean
 
         # Build sequence and indices
-        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, N_s, D_s)
+        z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
         actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
         step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
         signal_idx = jnp.full((B, T_ctx + 1), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
 
         # Predict clean for the current frame
-        z_clean_pred_seq = dynamics.apply(
+        z_clean_pred_seq, _ = dynamics.apply(
             dyn_vars,
             actions_full,
             step_idx,
@@ -243,7 +243,7 @@ def denoise_single_latent(
         # Update with α
         z_t = (1.0 - alpha) * z_t + alpha * z_clean_pred
 
-    return z_t  # (B,1,N_s,D_s)
+    return z_t  # (B,1,n_spatial,D_s)
 
 # ---------------------------
 # Multi-frame rollout wrapper
@@ -276,7 +276,7 @@ def sample_video(
     # 1) encode once (deterministic key)
     patches = temporal_patchify(frames, config.patch)
     z_btLd, _ = encoder.apply(enc_vars, patches, rngs={"mae": mae_key}, deterministic=True)
-    z_all = pack_bottleneck_to_spatial(z_btLd, n_s=config.n_s, k=config.packing_factor)  # (B,T,N_s,D_s)
+    z_all = pack_bottleneck_to_spatial(z_btLd, n_spatial=config.n_spatial, k=config.packing_factor)  # (B,T,n_spatial,D_s)
 
     # 2) split context vs future
     z_ctx_clean = z_all[:, :config.ctx_length, :, :]
@@ -294,8 +294,8 @@ def sample_video(
 
     # 3) floor: decoder recon of (ctx + GT future)
     floor_btLd = jnp.concatenate([
-        unpack_spatial_to_bottleneck(z_ctx_for_floor, n_s=config.n_s, k=config.packing_factor),
-        unpack_spatial_to_bottleneck(gt_future_latents, n_s=config.n_s, k=config.packing_factor)
+        unpack_spatial_to_bottleneck(z_ctx_for_floor, n_spatial=config.n_spatial, k=config.packing_factor),
+        unpack_spatial_to_bottleneck(gt_future_latents, n_spatial=config.n_spatial, k=config.packing_factor)
     ], axis=1)
     floor_patches = decoder.apply(dec_vars, floor_btLd, deterministic=True)
     floor_frames = temporal_unpatchify(floor_patches, H, W, C, config.patch)
@@ -305,7 +305,7 @@ def sample_video(
 
     # 5) rollout
     preds: list[jnp.ndarray] = []
-    N_s, D_s = int(z_all.shape[2]), int(z_all.shape[3])
+    n_spatial, D_s = int(z_all.shape[2]), int(z_all.shape[3])
 
     for t in range(horizon):
         action_curr = future_actions[:, t:t+1]
@@ -313,7 +313,7 @@ def sample_video(
 
         # Initial latent at tau0 (pure start → tau0=0)
         rng, z0key = jax.random.split(rng)
-        z0 = jax.random.normal(z0key, (B, 1, N_s, D_s), dtype=z_all.dtype)
+        z0 = jax.random.normal(z0key, (B, 1, n_spatial, D_s), dtype=z_all.dtype)
         z_t_init = z0
 
         rng, step_key = jax.random.split(rng)
@@ -345,8 +345,8 @@ def sample_video(
     # 6) decode predictions (prepend context for viz)
     pred_latents = jnp.concatenate(preds, axis=1)
     pred_btLd = jnp.concatenate([
-        unpack_spatial_to_bottleneck(z_all[:, :config.ctx_length, :, :], n_s=config.n_s, k=config.packing_factor),
-        unpack_spatial_to_bottleneck(pred_latents, n_s=config.n_s, k=config.packing_factor),
+        unpack_spatial_to_bottleneck(z_all[:, :config.ctx_length, :, :], n_spatial=config.n_spatial, k=config.packing_factor),
+        unpack_spatial_to_bottleneck(pred_latents, n_spatial=config.n_spatial, k=config.packing_factor),
     ], axis=1)
     pred_patches = decoder.apply(dec_vars, pred_btLd, deterministic=True)
     pred_frames = temporal_unpatchify(pred_patches, H, W, C, config.patch)

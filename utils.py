@@ -18,19 +18,19 @@ temporal_unpatchify = jax.jit(
     static_argnames=("H", "W", "C", "patch"),
 )
 
-def pack_bottleneck_to_spatial(z_btLd, *, n_s: int, k: int):
+def pack_bottleneck_to_spatial(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,N_b,D_b) -> (B,T,S_z, D_z_pre) by merging k tokens along N_b into channels.
-    Requires: N_b == n_s * k  (e.g., 512 -> 256 with k=2).
+    Requires: N_b == n_spatial * k  (e.g., 512 -> 256 with k=2).
     """
-    return rearrange(z_btLd, 'b t (n_s k) d -> b t n_s (k d)', n_s=n_s, k=k)
+    return rearrange(z_btLd, 'b t (n_spatial k) d -> b t n_spatial (k d)', n_spatial=n_spatial, k=k)
 
-def unpack_spatial_to_bottleneck(z_btLd, *, n_s: int, k: int):
+def unpack_spatial_to_bottleneck(z_btLd, *, n_spatial: int, k: int):
     """
     (B,T,S_z, D_z_pre) -> (B,T,N_b,D_b) by splitting D_z_pre into k channels along N_b.
-    Requires: N_b == n_s * k  (e.g., 256 -> 512 with k=2).
+    Requires: N_b == n_spatial * k  (e.g., 256 -> 512 with k=2).
     """
-    return rearrange(z_btLd, 'b t n_s (k d) -> b t (n_s k) d', n_s=n_s, k=k)
+    return rearrange(z_btLd, 'b t n_spatial (k d) -> b t (n_spatial k) d', n_spatial=n_spatial, k=k)
 
 # -------- Checkpoint helpers --------
 def with_params(variables, new_params):
