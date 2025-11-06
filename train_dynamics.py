@@ -862,9 +862,9 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="test_b200",
+        run_name="test_agent_tokens",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        use_wandb=True,
+        use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
