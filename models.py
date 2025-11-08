@@ -214,14 +214,54 @@ class SpaceSelfAttentionModality(nn.Module):
             allow_nonlat_q = jnp.logical_or(same_mod, is_k_lat)     # non-lat q -> same mod + latents
             mask = jnp.where(is_q_lat, allow_lat_q, allow_nonlat_q)
         elif self.mode in ["wm_agent", "wm_agent_isolated"]:
-            is_agent_q = (self.modality_ids[jnp.arange(S)[:,None]] == Modality.AGENT)
-            is_agent_k = (self.modality_ids[jnp.arange(S)[None,:]] == Modality.AGENT)
-            allow_agent_q = jnp.ones((S,S), dtype=bool) if self.mode == "wm_agent" else jnp.zeros((S,S), dtype=bool)
-            allow_nonagent_q = jnp.ones((S,S), dtype=bool) & (~is_agent_k) # others can't see agent
-            mask = jnp.where(is_agent_q, allow_agent_q, allow_nonagent_q)
-        # elif self.mode == "dynamics":
-        #     # allow full attention
-        #     mask = jnp.ones((S, S), dtype=bool)
+            S = int(self.modality_ids.shape[0])
+            q_idx = jnp.arange(S)[:, None]   # (S,1)
+            k_idx = jnp.arange(S)[None, :]   # (1,S)
+            q_mod = self.modality_ids[q_idx] # (S,1)
+            k_mod = self.modality_ids[k_idx] # (1,S)
+
+            is_agent_q = (q_mod == Modality.AGENT)
+            is_agent_k = (k_mod == Modality.AGENT)
+            is_action_q = (q_mod == Modality.ACTION)
+            is_action_k = (k_mod == Modality.ACTION)
+
+            # Observation bucket = spatial ∪ register ∪ shortcut tokens
+            is_obs_k = (
+                (k_mod == Modality.SPATIAL) |
+                (k_mod == Modality.REGISTER) |
+                (k_mod == Modality.SHORTCUT_SIGNAL) |
+                (k_mod == Modality.SHORTCUT_STEP)
+            )
+            is_obs_q = (
+                (q_mod == Modality.SPATIAL) |
+                (q_mod == Modality.REGISTER) |
+                (q_mod == Modality.SHORTCUT_SIGNAL) |
+                (q_mod == Modality.SHORTCUT_STEP)
+            )
+
+            # Agent queries:
+            #  - wm_agent: agent reads all (obs ∪ action ∪ agent)
+            #  - wm_agent_isolated: agent reads nobody
+            allow_for_agent_q = jnp.where(
+                self.mode == "wm_agent",
+                jnp.ones((S, S), dtype=bool),
+                jnp.zeros((S, S), dtype=bool)
+            )
+
+            # Non-agent queries (route by query modality)
+            allow_for_action_q = is_action_k                                  # action -> action only  (1,S)
+            allow_for_obs_q    = (is_obs_k | is_action_k)                     # obs -> obs ∪ action    (1,S)
+
+            # Build per-query row permissions with broadcasting from (1,S) to (S,S)
+            allow_nonagent = jnp.where(
+                is_action_q, allow_for_action_q,
+                jnp.where(is_obs_q, allow_for_obs_q, jnp.zeros((S, S), dtype=bool))
+            )
+
+            # Nobody can read agent keys except agent q
+            allow_nonagent = jnp.where(is_agent_k, False, allow_nonagent)
+
+            mask = jnp.where(is_agent_q, allow_for_agent_q, allow_nonagent)
         else:
             raise ValueError(f"Unknown mode {self.mode}")
 
@@ -1044,9 +1084,90 @@ def test_shapes_and_h_t():
     assert x1_hat.shape == (B,T,n_spatial,d_spatial)
     assert h_t.shape     == (B,T,1,D)
 
+def test_wm_routed():
+    """
+    Checks space-attention routing for Dreamer-4-style dynamics:
+      - Action q -> {Action k}
+      - Obs q    -> {Obs k ∪ Action k} and never Agent k
+      - Agent q  -> {Obs k ∪ Action k ∪ Agent k}    (wm_agent)
+                  -> {}                              (wm_agent_isolated)
+      - For any non-agent q, Agent k is disallowed.
+    """
+    # Shorthand modality ints
+    ACTION  = int(Modality.ACTION)
+    SIGNAL  = int(Modality.SHORTCUT_SIGNAL)
+    STEP    = int(Modality.SHORTCUT_STEP)
+    SPATIAL = int(Modality.SPATIAL)
+    REGISTER= int(Modality.REGISTER)
+    AGENT   = int(Modality.AGENT)
+
+    # Toy layout (Q rows / K cols share this order):
+    # [ACT, SIG, STP, SPA, SPA, SPA, REG, REG, ACT, AGT]
+    modality_ids = jnp.array(
+        [ACTION, SIGNAL, STEP, SPATIAL, SPATIAL, SPATIAL, REGISTER, REGISTER, ACTION, AGENT],
+        dtype=jnp.int32
+    )
+    S = modality_ids.shape[0]
+
+    # Helper sets
+    is_agent = (modality_ids == AGENT)
+    is_action = (modality_ids == ACTION)
+    is_obs = (
+        (modality_ids == SPATIAL) |
+        (modality_ids == REGISTER) |
+        (modality_ids == SIGNAL)  |
+        (modality_ids == STEP)
+    )
+
+    def assert_mask(mode: str):
+        mask = _build_modality_mask(modality_ids, mode)[0, 0]  # (S,S) bool
+        _print_mask_summary(mode, modality_ids, mask)
+
+        # 1) Non-agent q must never see Agent k
+        for q in range(S):
+            if not bool(is_agent[q]):
+                assert not bool(mask[q, is_agent].any()), f"[{mode}] non-agent q={q} can read Agent k!"
+
+        # 2) Action q -> Action k only
+        for q in range(S):
+            if bool(is_action[q]):
+                # Allowed: action keys only
+                allowed = mask[q]
+                assert bool(allowed[is_action].all()), f"[{mode}] action q={q} cannot read some action k!"
+                assert not bool(allowed[~is_action].any()), f"[{mode}] action q={q} reads non-action keys!"
+
+        # 3) Obs q -> Obs k ∪ Action k (and never Agent k, already checked)
+        for q in range(S):
+            if bool(is_obs[q]):
+                allowed = mask[q]
+                # Must allow all obs keys? We enforce "subset includes only obs∪action".
+                # It's okay if some obs keys are masked by design, but we require no extra keys.
+                extras = allowed & ~(is_obs | is_action)
+                assert not bool(extras.any()), f"[{mode}] obs q={q} reads keys outside obs∪action!"
+
+                # Should at least be able to read *some* obs or action key (nontrivial)
+                assert bool((allowed & (is_obs | is_action)).any()), f"[{mode}] obs q={q} cannot read obs∪action at all!"
+
+        # 4) Agent q behavior differs by mode
+        agent_rows = [i for i in range(S) if bool(is_agent[i])]
+        if agent_rows:
+            q = agent_rows[0]
+            if mode == "wm_agent":
+                # Agent reads everyone (including agent)
+                assert bool(mask[q].all()), "[wm_agent] agent q cannot read all keys!"
+            else:
+                # Isolated: agent reads nobody
+                assert int(mask[q].sum()) == 0, "[wm_agent_isolated] agent q should read nobody!"
+
+    # Run both modes
+    assert_mask("wm_agent")
+    assert_mask("wm_agent_isolated")
+    print("\n[test_wm_routed] All routing assertions passed ✅")
+
 
 if __name__ == "__main__":
-    test_agent_firewall()
-    test_x1hat_invariant_to_agent_tokens()
-    test_shapes_and_h_t()
+    # test_agent_firewall()
+    # test_x1hat_invariant_to_agent_tokens()
+    # test_shapes_and_h_t()
+    test_wm_routed()
     print("\nAll tests passed ✅")

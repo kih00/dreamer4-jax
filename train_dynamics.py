@@ -56,8 +56,8 @@ class RealismConfig:
     wandb_project: str | None = None  # if None, uses run_name as project
 
     # data
-    B: int = 4
-    T: int = 8
+    B: int = 64
+    T: int = 64
     H: int = 32
     W: int = 32
     C: int = 3
@@ -413,7 +413,7 @@ def build_tiled_video_frames(
     pred_np_all = _to_uint8(pred_frames)
 
     T_total = gt_np_all.shape[1]
-    ncols = 1 if batch_size <= 2 else min(2, batch_size)
+    ncols = 1 if batch_size <= 2 else min(8, batch_size)
     grid_frames = []
 
     for t_idx in range(T_total):
@@ -865,17 +865,17 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="test_agent_tokens",
+        run_name="train_ndynamics_newattn",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        use_wandb=False,
+        use_wandb=True,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
         max_steps=1_000_000_000,
         log_every=5_000,
         lr=1e-4,
-        write_video_every=100_000,
-        ckpt_save_every=1_000,
+        write_video_every=50_000,
+        ckpt_save_every=50_000,
         ckpt_max_to_keep=2,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
