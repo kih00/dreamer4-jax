@@ -40,6 +40,7 @@ This is an unofficial implementation of the [Dreamer 4](https://danijar.com/proj
     - [ ] Behavior cloning and reward model
         - [x] Update dynamics model architecture to take in agent tokens.
         - [ ] Finetune WM on actions and rewards
+            - [ ] proper handling of terminations, initial rewards, etc.
     - [ ] RL Training
 - [ ] Small offline RL dataset generation (Atari-5 or Craftax)
 - [ ] Interactive decision making
@@ -54,9 +55,28 @@ By default, this installs the CPU version of jax. Follow the instructions in the
 
 ## Dataset generation
 
-For now, we are generating bouncing square dataset in `data.py`. It outputs a (B,T,H,W,C) batch of data. We eventually need to add in actions and rewards for the dynamics model and RL training. 
+For now, we are generating bouncing square dataset in `data.py`. It outputs a (B,T,H,W,C) batch of data.
+
+We follow the Dreamer convention of indexing for transitions, in which action $a_i$ happens *before* $s_i$. The MDP executes like so:
+```
+# reset the env. a0, r0, d0 are all "null".
+T=0: a0, r0, d0, s0
+Agent takes in s0 and outputs a1. Call env.step(a1) to get next r,d,s
+T=1: a1, r1, d1, s1
+...
+T=T-1: a(T-1), r(T-1), d(T-1), s(T-1)
+Agent takes in s(T-1) and outputs aT. Call env.step(aT) to get next r,d,s.
+T=T: aT, rT, dT, sT
+```
+With this notation in mind, all initial (T=0) actions, rewards, and dones should be marked invalid and ignored during reward prediction, action prediction, value learning, etc. 
+
 
 <img src="docs/video.gif" width="500px">
+- frames: (B,T,H,W,C), normalized between 0 and 1
+- actions: (B,T,|A|), first timestep has dummy action
+- rewards: (B, T), reward data, first timestep has dummy reward
+- task: (B,), task ID as an integer
+
  
 ## Causal Tokenizer
 The Causal Tokenizer learns the representation for Dreamer 4.

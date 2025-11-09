@@ -9,7 +9,7 @@ from einops import rearrange
 # ============================================================
 
 # Action space (categorical):
-#   0: up, 1: down, 2: left, 3: right
+#   0: up, 1: down, 2: left, 3: right, 4: initial
 # Directions are in (dy, dx) order for image coordinates.
 ACTION_DELTAS_YX = jnp.array(
     [[-1, 0], [1, 0], [0, -1], [0, 1]], dtype=jnp.int32
@@ -36,7 +36,7 @@ def generate_batch(
     init_background_color: jnp.ndarray,  # (B, C) uint8 — per-sample background color
     init_foreground_color: jnp.ndarray,  # (B, C) uint8 — per-sample square color
     square_sizes: jnp.ndarray,           # (B,) int32  — side length per sample
-    actions: jnp.ndarray,                # (B, T) int32 ∈ {0,1,2,3,4}
+    actions: jnp.ndarray,                # (B, T-1) int32 ∈ {0,1,2,3}
     batch_size: int,
     time_steps: int,
     height: int,
@@ -59,6 +59,8 @@ def generate_batch(
     Returns:
         video:   (B,T,H,W,C) float32 in [0,1]
         actions: (B,T-1) int32
+        rewards: (B,T) float32 - pixel distance from square center to image center.
+            r_0 is dummy (NaN), r_t (t>=1) is reward from action a_t taken from s_{t-1}
     """
     H, W = height, width
     k_b = jnp.clip(square_sizes, 1, jnp.minimum(H, W))  # ensure squares fit
@@ -97,6 +99,31 @@ def generate_batch(
     # Vectorize over batch dimension
     positions = jax.vmap(integrate_one)(init_pos, k_b, actions)  # (B,T,2)
 
+    # --- Compute rewards: distance from square center to image center ---
+    # According to Dreamer convention:
+    # - r_0 is dummy (no action taken yet)
+    # - r_t (for t >= 1) is the reward from taking action a_t from state s_{t-1}
+    # So we compute rewards only for positions[1:] (states after actions)
+    # Image center coordinates
+    image_center_y = H / 2.0
+    image_center_x = W / 2.0
+    image_center = jnp.array([image_center_y, image_center_x])
+    
+    # Square centers: positions are top-left corners, so add half the square size
+    # positions: (B, T, 2) where last dim is (y, x)
+    # k_b: (B,) -> need to expand to (B, T, 1) for broadcasting
+    k_b_expanded = k_b[:, None, None]  # (B, 1, 1)
+    square_centers = positions.astype(jnp.float32) + k_b_expanded / 2.0  # (B, T, 2)
+    
+    # Compute pixel distance: sqrt((y_center - H/2)^2 + (x_center - W/2)^2)
+    # Only compute rewards for timesteps [1, T] (skip initial state at t=0)
+    distances = square_centers[:, 1:, :] - image_center  # (B, T-1, 2)
+    rewards_t1 = jnp.linalg.norm(distances, axis=-1)  # (B, T-1)
+    
+    # Prepend dummy reward at t=0 (use NaN so any accidental use will be obvious)
+    dummy_reward = jnp.full((batch_size, 1), jnp.nan, dtype=jnp.float32)
+    rewards = jnp.concatenate([dummy_reward, rewards_t1], axis=1)  # (B, T)
+
     # --- Paint frames based on positions ---
     ys = jnp.arange(H)
     xs = jnp.arange(W)
@@ -121,7 +148,7 @@ def generate_batch(
     y_idx = positions[..., 0]
     x_idx = positions[..., 1]
     video = paint_over_batch(video, y_idx, x_idx, init_foreground_color, k_b)
-    return (video.astype(jnp.float32) / 255.0, actions)
+    return (video.astype(jnp.float32) / 255.0, actions, rewards)
 
 
 # ============================================================
@@ -154,7 +181,7 @@ def make_iterator(
         chosen uniformly from the remaining 3.
 
     Returns:
-        next_fn(key) -> (new_key, (video, actions))
+        next_fn(key) -> (new_key, (video, actions, rewards))
 
     Args:
         batch_size: number of videos per batch
@@ -239,9 +266,10 @@ def make_iterator(
 
         Returns:
             new_key: updated PRNGKey
-            (video, actions):
+            (video, actions, rewards):
                 video   (B,T,H,W,C) float32 in [0,1]
-                actions (B,T) int32 in {0,1,2,3}
+                actions (B,T) int32 in {0,1,2,3,4} - a_0 is dummy (4), a_t (t>=1) are actual actions
+                rewards (B,T) float32 - r_0 is dummy (NaN), r_t (t>=1) is reward from action a_t
         """
         key, sub = jax.random.split(key)
         k_pos, k_bg, k_fg, k_size, k_act = jax.random.split(sub, 5)
@@ -271,11 +299,11 @@ def make_iterator(
         act_keys = jax.random.split(k_act, batch_size)
         actions = sample_actions_batch(act_keys)  # (B,T-1)
 
-        # generate video
-        video, _ = gen(init_pos, init_bg, init_fg, sizes, actions)
+        # generate video and rewards
+        video, _, rewards = gen(init_pos, init_bg, init_fg, sizes, actions)
         # prepend an empty action (value = 4) at t=0
         actions = jnp.concatenate([jnp.full((batch_size,1), 4, dtype=actions.dtype), actions], axis=1)
-        return key, (video, actions)
+        return key, (video, actions, rewards)
 
     return next
 
@@ -325,8 +353,12 @@ def test_iterator():
         hold_max=9,
     )
 
-    key, (video, actions) = next_step(key)
-    print("video", video.shape, video.dtype, "actions", actions.shape, actions.dtype)
+    key, (video, actions, rewards) = next_step(key)
+    print("video", video.shape, video.dtype, "actions", actions.shape, actions.dtype, "rewards", rewards.shape, rewards.dtype)
+    print("rewards[0] (should be NaN):", rewards[0, 0])
+    print("rewards[0] is NaN:", jnp.isnan(rewards[0, 0]))
+    print("rewards[1:] range:", rewards[:, 1:].min(), "to", rewards[:, 1:].max())
+    print("rewards[:, 1:] mean:", rewards[:, 1:].mean())
 
     # Concatenate all samples horizontally per frame for visualization
     def render_frame(_, frame):
