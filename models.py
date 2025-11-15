@@ -808,6 +808,52 @@ class RewardHeadMTP(nn.Module):
         return logits, centers_log
 
 
+class ValueHead(nn.Module):
+    """Value prediction with symexp twohot bins.
+    Input:  h_t (B, T, D)
+    Output: logits (B, T, K), centers (K,)
+    """
+    d_model: int
+    num_bins: int = 101
+    mlp_ratio: float = 2.0
+    dropout: float = 0.0
+    swiglu: bool = True
+    parity_2over3: bool = False
+    dtype: Any = jnp.float32
+    # log-space bounds for symexp bins (tune per dataset)
+    log_low: float = -8.0
+    log_high: float = 8.0
+
+    def setup(self):
+        self.projector = MLP(
+            d_model=self.d_model,
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            swiglu=self.swiglu,
+            parity_2over3=self.parity_2over3,
+            dtype=self.dtype,
+        )
+        self.out = nn.DenseGeneral(
+            features=self.num_bins,
+            axis=-1,
+            dtype=self.dtype,
+            name="out",
+        )
+        # Precompute bin centers as a constant (share across calls/checkpoints)
+        # Simple choice: uniform in log-space, then exponentiate symmetrically.
+        log_edges = jnp.linspace(self.log_low, self.log_high, self.num_bins)
+        # centers ~ same length for convenience (pad to K if using edges-midpoints):
+        centers = log_edges
+        self.centers_var = self.variable("constants", "symexp_centers_log", lambda: centers)
+
+    @nn.compact
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        x = self.projector(h_t, deterministic=deterministic)   # (B, T, D)
+        logits = self.out(x)                                   # (B, T, K)
+        centers_log = self.centers_var.value                   # (K,)
+        return logits, centers_log
+
+
 def test_encoder_decoder():
     rng = jax.random.PRNGKey(0)
     B = 2

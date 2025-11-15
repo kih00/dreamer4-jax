@@ -14,8 +14,9 @@ The high level plan is to first implement the entire algorithm, and validate on 
 Then, train and deploy on a more serious benchmark from Jasmine.
 
 <details>
-<summary><b>Architecture Details</b></summary>
+<summary><b>Detailed Roadmap</b></summary>
 <br>
+
 - [x] Toy Video Dataset generation
 - [x] Causal Tokenizer
     - [x] Space-time Axial Attention
