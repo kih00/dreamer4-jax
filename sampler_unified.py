@@ -2,12 +2,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
+from functools import partial
+from einops import pack, unpack, reduce
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from models import Encoder, Decoder, Dynamics
+from models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP
 from utils import (
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
@@ -176,13 +178,19 @@ def denoise_single_latent(
     start_mode: StartMode,
     tau0_fixed: float,
     rng_key: jax.Array,
-    clean_target_next: Optional[jnp.ndarray],  # (B,1,n_spatial,D_s) if TF else None
+    clean_target_next: Optional[jnp.ndarray] = None,  # (B,1,n_spatial,D_s) if TF else None
+    agent_tokens: jnp.ndarray = None, # (B, T_ctx + 1, n_agent, d_model)
     match_ctx_tau: bool = False,
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
     """
     Denoise a single future latent using a τ-ladder.
       - Uses adaptive mixing α = (τ_{s+1} − τ_s) / (1 − τ_s)
       - If match_ctx_tau=True, corrupt context to current τ at each step using a fixed z0_ctx
+      - Returns both the denoised latent and the hidden state h_t from the final step
+    
+    Returns:
+        z_t: (B, 1, n_spatial, D_s) denoised latent
+        h_t: (B, 1, n_agent, d_model) or None - hidden state from final dynamics call
     """
     B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
     _assert_power_of_two(k_max)
@@ -210,6 +218,9 @@ def denoise_single_latent(
     tau_seq, S, d_used, e = _tau_grid_from(k_max, schedule, d, tau0_aligned)
     tau_seq_host = list(np.asarray(tau_seq))  # host loop
 
+    # Initialize h_t_final to None (will be set on final iteration)
+    h_t_final = None
+
     # 4) iterate S steps
     for s in range(1, len(tau_seq_host)):
         tau_prev = float(tau_seq_host[s - 1])
@@ -230,20 +241,25 @@ def denoise_single_latent(
         signal_idx = jnp.full((B, T_ctx + 1), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
 
         # Predict clean for the current frame
-        z_clean_pred_seq, _ = dynamics.apply(
+        z_clean_pred_seq, h_seq = dynamics.apply(
             dyn_vars,
             actions_full,
             step_idx,
             signal_idx,
             z_seq,
+            agent_tokens=agent_tokens,
             deterministic=True,
         )
         z_clean_pred = z_clean_pred_seq[:, -1:, :, :]
+        
+        # Store hidden state from final step (tau=1.0)
+        if s == len(tau_seq_host) - 1 and h_seq is not None:
+            h_t_final = h_seq[:, -1:, :, :]  # (B, 1, n_agent, d_model)
 
         # Update with α
         z_t = (1.0 - alpha) * z_t + alpha * z_clean_pred
 
-    return z_t  # (B,1,n_spatial,D_s)
+    return z_t, h_t_final  # (B,1,n_spatial,D_s), (B,1,n_agent,d_model) or None
 
 # ---------------------------
 # Multi-frame rollout wrapper
@@ -317,7 +333,7 @@ def sample_video(
         z_t_init = z0
 
         rng, step_key = jax.random.split(rng)
-        z_clean_pred = denoise_single_latent(
+        z_clean_pred, _ = denoise_single_latent(
             dynamics=dynamics,
             dyn_vars=dyn_vars,
             actions_ctx=actions_ctx,
@@ -353,3 +369,171 @@ def sample_video(
 
     gt_frames = frames[:, :config.ctx_length + horizon]
     return pred_frames, floor_frames, gt_frames
+
+# ---------------------------
+# Imagination rollouts for RL training
+# ---------------------------
+
+# @partial(
+#     jax.jit,
+#     static_argnames=("dynamics", "task_embedder", "policy_head", "k_max", "horizon", "context_length", 
+#                     "n_spatial", "d", "start_mode"),
+# )
+def imagine_rollouts(
+    *,
+    dynamics: Dynamics,
+    task_embedder: TaskEmbedder,
+    policy_head: PolicyHeadMTP,
+    dyn_vars: Dict[str, Any],
+    task_vars: Dict[str, Any],
+    pi_vars: Dict[str, Any],
+    z_context: jnp.ndarray,  # (B, context_length, n_spatial, d_spatial)
+    context_actions: jnp.ndarray,  # (B, context_length)
+    task_ids: jnp.ndarray,  # (B,) task IDs for task embedder
+    k_max: int,
+    horizon: int,
+    context_length: int,
+    n_spatial: int,
+    d: float,  # step size for denoising schedule
+    start_mode: StartMode = "pure",
+    tau0_fixed: float = 0.5,
+    rng_key: jax.Array,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Generate imagined rollouts using dynamics and policy head.
+    
+    Similar to sample_video but queries the policy head to get actions instead of
+    using pre-specified actions.
+    
+    Args:
+        dynamics: Dynamics model
+        task_embedder: TaskEmbedder for agent tokens
+        policy_head: PolicyHeadMTP for action prediction
+        dyn_vars, task_vars, pi_vars: Model variables
+        z_context: (B, context_length, n_spatial, d_spatial) encoded context latents
+        context_actions: (B, context_length) context actions
+        task_ids: (B,) task IDs for task embedder
+        k_max: Maximum k for denoising schedule
+        horizon: Number of steps to imagine
+        context_length: Length of context
+        n_spatial: Number of spatial tokens
+        d: Step size for denoising (e.g., 1/k_max for finest)
+        start_mode: Start mode for denoising ("pure", "fixed", "random")
+        tau0_fixed: Fixed tau0 if start_mode == "fixed"
+        rng_key: PRNG key
+        
+    Returns:
+        imagined_latents: (B, horizon + 1, n_spatial, d_spatial)
+            - index 0 is the last context state (s_ctx_last)
+            - indices 1..horizon are imagined future states
+        imagined_actions: (B, horizon)
+            - actions[t] takes you from imagined_latents[:, t] → imagined_latents[:, t+1]
+        imagined_hidden_states: (B, horizon + 1, d_model)
+            - hidden state aligned with imagined_latents
+    """
+    B = z_context.shape[0]
+    D_s = z_context.shape[3]
+    d_model = policy_head.d_model
+    
+    # Initialize context
+    z_ctx_clean = z_context  # (B, context_length, n_spatial, d_spatial)
+    actions_ctx = context_actions  # (B, context_length)
+    
+    # Pre-compute agent tokens for entire rollout (task doesn't change)
+    agent_tokens_full = task_embedder.apply(
+        task_vars, task_ids, B, context_length + horizon
+    )  # (B, context_length + horizon, n_agent, d_model)
+    
+    # Compute step index from denoising step size d
+    # This ensures context uses the same step size as the imagination schedule
+    e = _step_idx_from_d(d, k_max)
+    e_jax = jnp.int32(e)
+    
+    # Prepare step and signal indices for initial context dynamics call
+    step_idx_ctx = jnp.full((B, context_length), e_jax, dtype=jnp.int32)
+    signal_idx_ctx = jnp.full((B, context_length), k_max - 1, dtype=jnp.int32)  # tau=1.0
+    
+    # Get initial hidden state from context (before loop starts)
+    _, h_ctx_init = dynamics.apply(
+        dyn_vars,
+        actions_ctx,
+        step_idx_ctx,
+        signal_idx_ctx,
+        z_ctx_clean,
+        agent_tokens=agent_tokens_full[:, :context_length, :, :],
+        deterministic=True,
+    )  # h_ctx_init: (B, context_length, n_agent, d_model)
+    h_pooled_init = reduce(h_ctx_init, 'b t n_agent d_model -> b t d_model', 'mean')  # (B, context_length, d_model)
+    h = h_pooled_init[:, -1, :]  # (B, d_model) - use last timestep
+
+    # Pre-allocate output arrays (include starting state as index 0)
+    imagined_latents = jnp.zeros((B, horizon + 1, n_spatial, D_s), dtype=z_context.dtype)
+    imagined_actions = jnp.zeros((B, horizon), dtype=jnp.int32)
+    imagined_hidden_states = jnp.zeros((B, horizon + 1, d_model), dtype=z_context.dtype)
+
+    # Set starting state (last context latent and its hidden state) at index 0
+    z_start = z_ctx_clean[:, -1, :, :]  # (B, n_spatial, D_s)
+    imagined_latents = imagined_latents.at[:, 0, :, :].set(z_start)
+    imagined_hidden_states = imagined_hidden_states.at[:, 0, :].set(h)
+    
+    rng = rng_key
+    
+    for t in range(horizon):
+        # Use current hidden state h to predict next action
+        h_for_policy = h[:, None, :]  # (B, 1, d_model)
+        # Query policy head to get action logits
+        pi_logits = policy_head.apply(
+            pi_vars, h_for_policy, deterministic=True
+        )  # (B, 1, L, A)
+        
+        # Sample action from the first predicted action (index 0 in L dimension)
+        rng, action_key = jax.random.split(rng)
+        logp = jax.nn.log_softmax(pi_logits[:, 0, 0, :], axis=-1)  # (B, A)
+        action_curr = jax.random.categorical(action_key, logp, axis=-1)  # (B,)
+        action_curr = action_curr[:, None]  # (B, 1)
+        
+        # Use denoise_single_latent to get next latent prediction
+        rng, z0key = jax.random.split(rng)
+        z0 = jax.random.normal(z0key, (B, 1, n_spatial, D_s), dtype=z_ctx_clean.dtype)
+        z_t_init = z0
+        
+        rng, step_key = jax.random.split(rng)
+        
+        # Slice agent tokens for current sequence length: [0, context_length + t + 1]
+        # This includes context + all imagined steps up to t, plus one more for the new timestep
+        agent_tokens_seq = agent_tokens_full[:, t:context_length + t + 1, :, :]
+        
+        z_clean_pred, h_t_pred = denoise_single_latent(
+            dynamics=dynamics,
+            dyn_vars=dyn_vars,
+            actions_ctx=actions_ctx,
+            action_curr=action_curr,
+            z_ctx_clean=z_ctx_clean,
+            z_t_init=z_t_init,
+            k_max=k_max,
+            d=d,
+            start_mode=start_mode,
+            tau0_fixed=tau0_fixed,
+            rng_key=step_key,
+            match_ctx_tau=False,
+            agent_tokens=agent_tokens_seq,
+        )  # z_clean_pred: (B, 1, n_spatial, d_spatial), h_t_pred: (B, 1, n_agent, d_model) or None
+        
+        # Pool hidden state from denoising step for next iteration
+        h_pooled_pred = reduce(h_t_pred, 'b t n_agent d_model -> b t d_model', 'mean')  # (B, 1, d_model)
+        h_next = h_pooled_pred[:, 0, :]  # (B, d_model)
+        
+        # Store results in pre-allocated arrays
+        # Latents/hidden are shifted by +1 because index 0 holds the starting context state
+        imagined_latents = imagined_latents.at[:, t + 1, :, :].set(z_clean_pred[:, 0, :, :])
+        imagined_actions = imagined_actions.at[:, t].set(action_curr[:, 0])
+        imagined_hidden_states = imagined_hidden_states.at[:, t + 1, :].set(h_next)
+        
+        # Update context autoregressively
+        z_ctx_clean = jnp.concatenate([z_ctx_clean, z_clean_pred], axis=1)[:, -context_length:, :, :]
+        actions_ctx = jnp.concatenate([actions_ctx, action_curr], axis=1)[:, -context_length:]
+        
+        # Update h for next iteration (use h_next from denoising)
+        h = h_next
+    
+    return imagined_latents, imagined_actions, imagined_hidden_states

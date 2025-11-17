@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
+import matplotlib.pyplot as plt
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -26,11 +27,14 @@ from models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, Rewa
 from data import make_iterator
 from utils import (
     temporal_patchify,
+    temporal_unpatchify,
     pack_bottleneck_to_spatial,
+    unpack_spatial_to_bottleneck,
     with_params,
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
 )
+from sampler_unified import imagine_rollouts
 
 # ---------------------------
 # Config
@@ -51,7 +55,7 @@ class RLConfig:
     wandb_project: str | None = None  # if None, uses run_name as project
 
     # data
-    B: int = 64
+    B: int = 16
     T: int = 64
     H: int = 32
     W: int = 32
@@ -62,7 +66,7 @@ class RLConfig:
     hold_min: int = 4
     hold_max: int = 9
     diversify_data: bool = True
-    action_dim: int = 5  # number of categorical actions
+    action_dim: int = 4  # number of categorical actions
 
     # tokenizer / dynamics config (should match BC/rew training)
     patch: int = 4
@@ -89,6 +93,7 @@ class RLConfig:
 
     # eval media toggle
     write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+    visualize_every: int = 25_000  # how often to visualize imagined rollouts, or 0 to disable
 
     # RL-specific settings
     L: int = 2  # predict next L actions/rewards (from BC/rew training)
@@ -102,6 +107,7 @@ class RLConfig:
     lambda_: float = 0.95  # lambda for TD(lambda) returns
     horizon: int = 32  # imagination horizon for rollouts
     context_length: int = 16  # length of context sequences sampled from videos
+    imagination_d: float = 1.0/4  # denoising step size for imagination (None = finest, i.e., 1/k_max)
 
 # ---------------------------
 # Small helpers
@@ -528,6 +534,308 @@ def make_rl_meta(
     }
 
 # ---------------------------
+# Visualization utilities
+# ---------------------------
+
+def _to_uint8(img_f32):
+    return np.asarray(np.clip(np.asarray(img_f32) * 255.0, 0, 255), dtype=np.uint8)
+
+def _symlog(x):
+    return jnp.sign(x) * jnp.log1p(jnp.abs(x))
+
+def _symexp(y):
+    # inverse of symlog
+    return jnp.sign(y) * (jnp.expm1(jnp.abs(y)))
+
+def _save_imagined_strip(fig_path: Path, frames_b_t_hwc: np.ndarray,
+                         actions_bt: np.ndarray | None,
+                         rewards_bt: np.ndarray | None,
+                         values_bt: np.ndarray | None,
+                         td_returns_bt: np.ndarray | None,
+                         title: str,
+                         b_index: int = 0):
+    """
+    Save a strip visualization of imagined rollouts.
+    
+    - frames_b_t_hwc: (B, horizon, H, W, C) - imagined frames
+    - actions_bt: (B, horizon) - imagined actions
+    - rewards_bt: (B, horizon) - predicted rewards
+    - values_bt: (B, horizon) - predicted values (for states after actions)
+    - td_returns_bt: (B, horizon) - TD(lambda) returns
+    """
+    frames = _to_uint8(frames_b_t_hwc)
+    B, hor = frames.shape[:2]
+    b = int(np.clip(b_index, 0, B-1))
+    cols = hor
+    
+    fig, axes = plt.subplots(2, cols, figsize=(cols*2.2, 4.0), constrained_layout=True)
+    fig.suptitle(title, fontsize=12)
+    
+    # row 0: images of imagined frames
+    for i in range(hor):
+        ax = axes[0, i]
+        ax.imshow(frames[b, i])
+        ax.axis('off')
+        ax.set_title(f"t+{i+1}", fontsize=9)
+    
+    # row 1: annotations (actions, rewards, values, TD returns)
+    for i in range(hor):
+        parts = []
+        if actions_bt is not None:
+            parts.append(f"act={int(actions_bt[b, i])}")
+        if rewards_bt is not None:
+            parts.append(f"r={float(rewards_bt[b, i]):.3f}")
+        if values_bt is not None:
+            parts.append(f"v={float(values_bt[b, i]):.3f}")
+        if td_returns_bt is not None:
+            parts.append(f"R={float(td_returns_bt[b, i]):.3f}")
+        
+        ax = axes[1, i]
+        ax.axis('off')
+        ax.text(0.5, 0.5, "\n".join(parts) if parts else "", ha='center', va='center', fontsize=7)
+    
+    fig.savefig(fig_path, dpi=140)
+    plt.close(fig)
+
+def _save_scores_lineplot(fig_path: Path,
+                          rewards_h: np.ndarray,
+                          values_h: np.ndarray,
+                          td_returns_h: np.ndarray,
+                          title: str):
+    """
+    Save a line plot showing rewards, values, and TD returns over the horizon.
+    
+    rewards_h: (horizon,)
+    values_h: (horizon,) - values for states after actions
+    td_returns_h: (horizon,) - TD(lambda) returns
+    """
+    H = rewards_h.shape[0]
+    xs = np.arange(1, H+1)
+    plt.figure(figsize=(max(6, H*0.6), 4.0))
+    plt.plot(xs, rewards_h, label="Reward", linewidth=2, marker='o', markersize=4)
+    plt.plot(xs, values_h, label="Value", linewidth=2, marker='s', markersize=4)
+    plt.plot(xs, td_returns_h, label="TD(λ) Return", linewidth=2, marker='^', markersize=4)
+    plt.xlabel("timestep (+offset)")
+    plt.ylabel("score")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(fig_path, dpi=140)
+    plt.close()
+
+def visualize_imagined_rollouts(
+    imagined_latents: jnp.ndarray,  # (B, horizon + 1, n_spatial, d_spatial)
+    imagined_actions: jnp.ndarray,  # (B, horizon)
+    rewards: jnp.ndarray,  # (B, horizon)
+    values: jnp.ndarray,  # (B, horizon + 1)
+    td_lambda_returns: jnp.ndarray,  # (B, horizon)
+    decoder: Decoder,
+    dec_vars: dict,
+    n_spatial: int,
+    packing_factor: int,
+    H: int,
+    W: int,
+    C: int,
+    patch: int,
+    horizon: int,
+    vis_dir: Path,
+    step: int,
+    max_examples: int = 4,
+):
+    """
+    Visualize imagined rollouts by decoding latents to frames and displaying scores.
+    
+    Args:
+        imagined_latents: (B, horizon + 1, n_spatial, d_spatial) - includes starting state at index 0
+        imagined_actions: (B, horizon) - actions taken
+        rewards: (B, horizon) - predicted rewards
+        values: (B, horizon + 1) - predicted values
+        td_lambda_returns: (B, horizon) - TD(lambda) returns
+        decoder: decoder model
+        dec_vars: decoder variables
+        n_spatial, packing_factor: spatial packing params
+        H, W, C, patch: image dimensions
+        horizon: number of imagined steps
+        vis_dir: directory to save visualizations
+        step: current training step
+        max_examples: max number of examples to visualize
+    """
+    B = imagined_latents.shape[0]
+    
+    # Extract only the imagined future states (indices 1..horizon) for visualization
+    # Skip index 0 which is the last context state
+    imagined_future_latents = imagined_latents[:, 1:, :, :]  # (B, horizon, n_spatial, d_spatial)
+    
+    # Unpack spatial to bottleneck format
+    imagined_bottleneck = unpack_spatial_to_bottleneck(
+        imagined_future_latents,
+        n_spatial=n_spatial,
+        k=packing_factor
+    )  # (B, horizon, n_latents, d_bottleneck)
+    
+    # Decode to frames
+    imagined_patches = decoder.apply(
+        dec_vars,
+        imagined_bottleneck,
+        rngs={"dropout": jax.random.PRNGKey(0)},
+        deterministic=True
+    )  # (B, horizon, N_patches, D_patch)
+    
+    imagined_frames = temporal_unpatchify(
+        imagined_patches, H, W, C, patch
+    )  # (B, horizon, H, W, C)
+    
+    # Convert to numpy for visualization
+    rewards_np = np.asarray(rewards)  # (B, horizon)
+    values_np = np.asarray(values)  # (B, horizon + 1)
+    td_returns_np = np.asarray(td_lambda_returns)  # (B, horizon)
+    
+    # For strip visualization, use values after actions (indices 1..horizon)
+    values_after_actions = values_np[:, 1:]  # (B, horizon)
+    
+    # Save visualizations for a few examples
+    num_examples = min(max_examples, B)
+    for ei in range(num_examples):
+        # Strip visualization with frames, actions, rewards, values, TD returns
+        fig_path = vis_dir / f"imagined_rollout_step{step:06d}_b{ei}.png"
+        _save_imagined_strip(
+            fig_path,
+            np.asarray(imagined_frames),
+            np.asarray(imagined_actions),
+            rewards_np,
+            values_after_actions,
+            td_returns_np,
+            title=f"Imagined Rollout (step={step}, example={ei})",
+            b_index=ei,
+        )
+        
+        # Line plot showing rewards, values, and TD returns over time
+        plot_path = vis_dir / f"imagined_scores_step{step:06d}_b{ei}.png"
+        _save_scores_lineplot(
+            plot_path,
+            rewards_np[ei],
+            values_after_actions[ei],
+            td_returns_np[ei],
+            title=f"Scores over Horizon (step={step}, example={ei})",
+        )
+    
+    print(f"[viz] Saved {num_examples} imagined rollout visualizations to {vis_dir}")
+
+# ---------------------------
+# Score rollouts: compute rewards, values, and TD(lambda) returns
+# ---------------------------
+
+def score_rollouts(
+    imagined_hidden_states: jnp.ndarray,  # (B, horizon + 1, d_model)
+    reward_head: RewardHeadMTP,
+    value_head: ValueHead,
+    rew_vars: dict,
+    val_vars: dict,
+    gamma: float,
+    lambda_: float,
+    horizon: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Score imagined rollouts by computing rewards, values, and TD(lambda) returns.
+    
+    Args:
+        imagined_hidden_states: (B, horizon + 1, d_model) - hidden states
+            - Index 0 is the last context state
+            - Indices 1..horizon are imagined future states
+        reward_head, value_head: models
+        rew_vars, val_vars: model variables
+        gamma: discount factor
+        lambda_: lambda parameter for TD(lambda)
+        horizon: number of imagined steps
+        
+    Returns:
+        rewards: (B, horizon) - predicted rewards for actions at timesteps 0..horizon-1
+        values: (B, horizon + 1) - predicted values for states at timesteps 0..horizon
+        td_lambda_returns: (B, horizon) - TD(lambda) returns for timesteps 0..horizon-1
+    """
+    B = imagined_hidden_states.shape[0]
+    
+    # Compute rewards for actions taken at each imagined step
+    # According to data format: r_t is reward from taking action a_t from state s_{t-1}
+    # So for imagined_actions[i], we predict reward from imagined_hidden_states[i] (state before action)
+    # We use indices 0..horizon-1 to predict rewards for actions 0..horizon-1
+    hidden_before_actions = imagined_hidden_states[:, :horizon, :]  # (B, horizon, d_model)
+    
+    rw_logits, centers_log_rw = reward_head.apply(
+        rew_vars,
+        hidden_before_actions,  # (B, horizon, d_model) - states before taking actions
+        deterministic=True
+    )  # rw_logits: (B, horizon, L, K), centers_log_rw: (K,)
+    
+    # Decode predicted rewards (expectation in symlog space)
+    # Use offset 0 (next step reward)
+    o1 = 0
+    o1 = min(o1, rw_logits.shape[2] - 1)  # ensure valid offset
+    probs_rw = jax.nn.softmax(rw_logits[:, :, o1, :], axis=-1)  # (B, horizon, K)
+    exp_symlog_rw = jnp.sum(probs_rw * centers_log_rw[None, None, :], axis=-1)  # (B, horizon)
+    rewards = _symexp(exp_symlog_rw)  # (B, horizon)
+    
+    # Compute values for all states (including starting state and all imagined states)
+    # Values are predicted for states, so we use all hidden states
+    val_logits, centers_log_val = value_head.apply(
+        val_vars,
+        imagined_hidden_states,  # (B, horizon + 1, d_model)
+        deterministic=True
+    )  # val_logits: (B, horizon + 1, K), centers_log_val: (K,)
+    
+    # Decode predicted values (expectation in symlog space)
+    probs_val = jax.nn.softmax(val_logits, axis=-1)  # (B, horizon + 1, K)
+    exp_symlog_val = jnp.sum(probs_val * centers_log_val[None, None, :], axis=-1)  # (B, horizon + 1)
+    values = _symexp(exp_symlog_val)  # (B, horizon + 1)
+    
+    # Compute TD(lambda) returns backwards from the end
+    # Formula: R^λ_t = r_t + γ * ((1-λ) * v_{t+1} + λ * R^λ_{t+1})
+    # At the last timestep: R^λ_{horizon-1} = r_{horizon-1} + γ * v_{horizon}
+    # Then work backwards: R^λ_t = r_t + γ * ((1-λ) * v_{t+1} + λ * R^λ_{t+1})
+    
+    # Use scan to compute backwards (JAX-compatible)
+    # We'll scan from the end, carrying the next return value
+    def backward_step(carry, t_reversed):
+        """
+        carry: next_return (B,) - R^λ_{t+1} where t+1 is the next timestep in forward order
+        t_reversed: timestep index in reverse order (horizon-2, horizon-3, ..., 0)
+        returns: (next_return, current_return) where current_return = R^λ_t
+        """
+        # Convert reverse index to forward index
+        t = horizon - 2 - t_reversed  # maps [0, 1, ..., horizon-2] to [horizon-2, horizon-3, ..., 0]
+        next_return = carry  # R^λ_{t+1}
+        next_value = values[:, t + 1]  # v_{t+1}
+        blended = (1.0 - lambda_) * next_value + lambda_ * next_return
+        current_return = rewards[:, t] + gamma * blended  # R^λ_t
+        return current_return, current_return
+    
+    # Initialize with the last timestep return: R^λ_{horizon-1} = r_{horizon-1} + γ * v_{horizon}
+    init_return = rewards[:, horizon - 1] + gamma * values[:, horizon]
+    
+    # Scan backwards: process timesteps [horizon-2, horizon-3, ..., 0]
+    if horizon > 1:
+        # Create scan indices [0, 1, ..., horizon-2] which will map to [horizon-2, ..., 0] in the function
+        scan_indices = jnp.arange(horizon - 1)  # [0, 1, ..., horizon-2]
+        _, td_returns_reversed = jax.lax.scan(
+            backward_step,
+            init_return,
+            scan_indices,
+        )
+        # scan returns shape (horizon-1, B), transpose to (B, horizon-1)
+        td_returns_reversed = td_returns_reversed.T  # (B, horizon-1)
+        # td_returns_reversed is in order [R^λ_{horizon-2}, R^λ_{horizon-3}, ..., R^λ_0] per batch
+        # Reverse along time axis to get [R^λ_0, R^λ_1, ..., R^λ_{horizon-2}]
+        td_returns_rest = jnp.flip(td_returns_reversed, axis=1)  # (B, horizon-1)
+        # Concatenate with the last return: [R^λ_0, ..., R^λ_{horizon-2}, R^λ_{horizon-1}]
+        td_lambda_returns = jnp.concatenate([td_returns_rest, init_return[:, None]], axis=1)  # (B, horizon)
+    else:
+        # Edge case: horizon == 1
+        td_lambda_returns = init_return[:, None]  # (B, 1)
+    
+    return rewards, values, td_lambda_returns
+
+# ---------------------------
 # Main
 # ---------------------------
 
@@ -621,15 +929,64 @@ def run(cfg: RLConfig):
         context_frames, context_actions, context_rewards = sample_contexts(
             videos, actions_full, rewards_full, ctx_key, cfg.context_length, cfg.H, cfg.W, cfg.C
         )
-        import ipdb; ipdb.set_trace()
         
+        # Encode context_frames into latents using encoder
+        # context_frames: (B, context_length, H, W, C)
+        context_patches = temporal_patchify(context_frames, patch)  # (B, context_length, Np, Dp)
+        z_btLd, _ = train_state.encoder.apply(
+            train_state.enc_vars, 
+            context_patches, 
+            rngs={"mae": train_state.mae_eval_key}, 
+            deterministic=True
+        )  # z_btLd: (B, context_length, n_latents, d_bottleneck)
+        z_context = pack_bottleneck_to_spatial(
+            z_btLd, 
+            n_spatial=n_spatial, 
+            k=cfg.packing_factor
+        )  # z_context: (B, context_length, n_spatial, d_spatial)
+        
+        # Generate imagined rollouts using dynamics + policy_head
+        train_rng, imag_key = jax.random.split(train_rng)
+        # Use dummy task IDs (zeros) for now - can be made configurable later
+        task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+
+
+        # TODO: refactor imagine rollouts so that it is JITable.
+        imagined_latents, imagined_actions, imagined_hidden_states = imagine_rollouts(
+            dynamics=train_state.dynamics,
+            task_embedder=train_state.task_embedder,
+            policy_head=train_state.policy_head,
+            dyn_vars=train_state.dyn_vars,
+            task_vars=train_state.task_vars,
+            pi_vars=train_state.pi_vars,
+            z_context=z_context,
+            context_actions=context_actions,
+            task_ids=task_ids,
+            k_max=k_max,
+            horizon=cfg.horizon,
+            context_length=cfg.context_length,
+            n_spatial=n_spatial,
+            d=cfg.imagination_d,
+            start_mode="pure",
+            rng_key=imag_key,
+        )
+        
+        # Score rollouts: compute rewards, values, and TD(lambda) returns
+        rewards, values, td_lambda_returns = score_rollouts(
+            imagined_hidden_states=imagined_hidden_states,
+            reward_head=train_state.reward_head,
+            value_head=train_state.value_head,
+            rew_vars=train_state.rew_vars,
+            val_vars=train_state.val_vars,
+            gamma=cfg.gamma,
+            lambda_=cfg.lambda_,
+            horizon=cfg.horizon,
+        )
+        
+    
         # TODO: Implement training step
-        # - Encode context_frames into latents using encoder
-        # - Generate imagined rollouts using dynamics + policy_head
-        # - Compute rewards using reward_head (frozen)
-        # - Compute values using value_head (trainable)
-        # - Compute TD(lambda) returns
-        # - Train policy_head and value_head
+        # - Train value_head to predict TD(lambda) returns
+        # - Train policy_head using PMPO (sign of advantages A_t = R^λ_t - v_t)
         # - Apply behavioral prior regularization (KL divergence from policy_head_bc)
         
         if step % cfg.log_every == 0:
@@ -637,7 +994,28 @@ def run(cfg: RLConfig):
             
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({"step": step}, step=step)
-
+      
+        # Visualize imagined rollouts (decode latents to frames and display scores)
+        if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+            visualize_imagined_rollouts(
+                imagined_latents=imagined_latents,
+                imagined_actions=imagined_actions,
+                rewards=rewards,
+                values=values,
+                td_lambda_returns=td_lambda_returns,
+                decoder=train_state.decoder,
+                dec_vars=train_state.dec_vars,
+                n_spatial=n_spatial,
+                packing_factor=cfg.packing_factor,
+                H=cfg.H,
+                W=cfg.W,
+                C=cfg.C,
+                patch=patch,
+                horizon=cfg.horizon,
+                vis_dir=vis_dir,
+                step=step,
+                max_examples=4,
+            )      
         # Save checkpoint
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
         maybe_save(mngr, step, state, meta)
@@ -657,7 +1035,7 @@ def run(cfg: RLConfig):
 if __name__ == "__main__":
     cfg = RLConfig(
         run_name="train_policy",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew/checkpoints",
+        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_4actions/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",

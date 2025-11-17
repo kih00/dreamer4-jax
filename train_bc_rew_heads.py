@@ -1064,7 +1064,7 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_bc_rew",
+        run_name="train_bc_rew_4actions",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
         use_wandb=True,
@@ -1080,6 +1080,7 @@ if __name__ == "__main__":
         loss_weight_shortcut=1.0,
         loss_weight_policy=0.3,
         loss_weight_reward=0.3,
+        action_dim=4,
     )
     print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
     run(cfg)
