@@ -9,6 +9,7 @@ from typing import Dict, Any
 from functools import partial
 import json
 import time
+from einops import rearrange
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +35,7 @@ from utils import (
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params,
 )
-from sampler_unified import imagine_rollouts
+from sampler_old import imagine_rollouts
 
 # ---------------------------
 # Config
@@ -98,6 +99,8 @@ class RLConfig:
     # RL-specific settings
     L: int = 2  # predict next L actions/rewards (from BC/rew training)
     num_reward_bins: int = 101  # twohot bins for symexp rewards
+    reward_log_low: float = -3.0  # log-space lower bound for reward bins (should match BC/rew training)
+    reward_log_high: float = 3.0  # log-space upper bound for reward bins (should match BC/rew training)
     num_value_bins: int = 101  # twohot bins for symexp values
     n_tasks: int = 128  # task-ID space for TaskEmbedder
     use_task_ids: bool = True  # True: discrete task IDs; False: vector embed
@@ -108,6 +111,8 @@ class RLConfig:
     horizon: int = 32  # imagination horizon for rollouts
     context_length: int = 16  # length of context sequences sampled from videos
     imagination_d: float = 1.0/4  # denoising step size for imagination (None = finest, i.e., 1/k_max)
+    alpha: float = 0.5  # PMPO positive/negative balance (0.5 = equal weight)
+    beta: float = 0.3  # behavioral prior KL regularization strength
 
 # ---------------------------
 # Small helpers
@@ -404,7 +409,13 @@ def initialize_models(
     task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
                                  use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
     policy_head_bc = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins)
+    reward_head = RewardHeadMTP(
+        d_model=cfg.d_model_dyn, 
+        L=cfg.L, 
+        num_bins=cfg.num_reward_bins,
+        log_low=cfg.reward_log_low,
+        log_high=cfg.reward_log_high,
+    )
     
     # NEW: RL policy head and value head
     policy_head = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
@@ -546,6 +557,30 @@ def _symlog(x):
 def _symexp(y):
     # inverse of symlog
     return jnp.sign(y) * (jnp.expm1(jnp.abs(y)))
+
+def _twohot_symlog_targets(values, centers_log):
+    """
+    values: (...,) real values (e.g., TD(lambda) returns)
+    centers_log: (K,) bin centers in symlog space (log-scale symmetric grid)
+    returns: (..., K) two-hot targets that sum to 1
+    """
+    y = _symlog(values)
+    K = centers_log.shape[0]
+
+    idx_r = jnp.searchsorted(centers_log, y, side='right')
+    idx_l = jnp.maximum(idx_r - 1, 0)
+
+    idx_r = jnp.minimum(idx_r, K - 1)
+    idx_l = jnp.minimum(idx_l, K - 1)
+
+    c_l = jnp.take(centers_log, idx_l)
+    c_r = jnp.take(centers_log, idx_r)
+    denom = jnp.maximum(c_r - c_l, 1e-8)
+    frac = jnp.where(idx_r == idx_l, 0.0, (y - c_l) / denom)
+
+    oh_l = jax.nn.one_hot(idx_l, K)
+    oh_r = jax.nn.one_hot(idx_r, K)
+    return oh_l * (1.0 - frac)[..., None] + oh_r * frac[..., None]
 
 def _save_imagined_strip(fig_path: Path, frames_b_t_hwc: np.ndarray,
                          actions_bt: np.ndarray | None,
@@ -723,117 +758,224 @@ def visualize_imagined_rollouts(
     print(f"[viz] Saved {num_examples} imagined rollout visualizations to {vis_dir}")
 
 # ---------------------------
-# Score rollouts: compute rewards, values, and TD(lambda) returns
+# Training step: value and policy losses
 # ---------------------------
-
-def score_rollouts(
-    imagined_hidden_states: jnp.ndarray,  # (B, horizon + 1, d_model)
+@partial(
+    jax.jit,
+    static_argnames=("reward_head", "value_head", "policy_head", "policy_head_bc", "tx", "horizon", "gamma", "lambda_", "alpha", "beta"),
+)
+def train_step(
     reward_head: RewardHeadMTP,
     value_head: ValueHead,
+    policy_head: PolicyHeadMTP,
+    policy_head_bc: PolicyHeadMTP,
+    tx: optax.Transform,
+    params: dict,
+    opt_state: optax.OptState,
     rew_vars: dict,
     val_vars: dict,
+    pi_vars: dict,
+    pi_bc_vars: dict,
+    imagined_hidden_states: jnp.ndarray,  # (B, horizon + 1, d_model)
+    imagined_actions: jnp.ndarray,  # (B, horizon)
+    horizon: int,
     gamma: float,
     lambda_: float,
-    horizon: int,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    alpha: float,
+    beta: float,
+    rng_key: jax.Array,
+) -> tuple[dict, optax.OptState, dict]:
     """
-    Score imagined rollouts by computing rewards, values, and TD(lambda) returns.
+    Single training step for value head and policy head using PMPO.
+    
+    Computes TD(lambda) returns from imagined rollouts, trains the value head to predict
+    these returns, and trains the policy head using PMPO (Positive-Maximum Policy Optimization)
+    which separates states by advantage sign and applies different loss terms.
     
     Args:
-        imagined_hidden_states: (B, horizon + 1, d_model) - hidden states
-            - Index 0 is the last context state
-            - Indices 1..horizon are imagined future states
-        reward_head, value_head: models
-        rew_vars, val_vars: model variables
-        gamma: discount factor
-        lambda_: lambda parameter for TD(lambda)
-        horizon: number of imagined steps
+        reward_head: Frozen reward prediction head (MTP)
+        value_head: Trainable value prediction head
+        policy_head: Trainable policy head (MTP)
+        policy_head_bc: Frozen BC policy head used as behavioral prior
+        tx: Optimizer transform
+        params: {"pi": ..., "val": ...} - only trainable params
+        opt_state: Optimizer state
+        rew_vars: Reward head variables (frozen, full dict)
+        val_vars: Value head variables (full dict, params will be replaced)
+        pi_vars: Policy head variables (full dict, params will be replaced)
+        pi_bc_vars: BC policy head variables (frozen, full dict)
+        imagined_hidden_states: (B, horizon + 1, d_model) - hidden states from imagination
+        imagined_actions: (B, horizon) - actions taken during imagination
+        horizon: Number of imagined steps
+        gamma: Discount factor for TD(lambda) computation
+        lambda_: Lambda parameter for TD(lambda) return computation
+        alpha: PMPO positive/negative balance (typically 0.5)
+        beta: Behavioral prior KL regularization strength (typically 0.3)
+        rng_key: PRNG key for dropout
         
     Returns:
-        rewards: (B, horizon) - predicted rewards for actions at timesteps 0..horizon-1
-        values: (B, horizon + 1) - predicted values for states at timesteps 0..horizon
-        td_lambda_returns: (B, horizon) - TD(lambda) returns for timesteps 0..horizon-1
+        new_params: Updated trainable parameters
+        new_opt_state: Updated optimizer state
+        aux: Auxiliary metrics dict containing:
+            - val_loss: Value prediction loss
+            - pi_loss: Total policy loss
+            - pi_loss_negative: Negative advantage set loss
+            - pi_loss_positive: Positive advantage set loss
+            - pi_kl_loss: KL divergence from BC prior
+            - n_positive: Number of states with positive advantages
+            - n_negative: Number of states with negative advantages
+            - mean_advantage: Mean advantage across all states
+            - mean_td_return: Mean TD(lambda) return
     """
     B = imagined_hidden_states.shape[0]
     
-    # Compute rewards for actions taken at each imagined step
-    # According to data format: r_t is reward from taking action a_t from state s_{t-1}
-    # So for imagined_actions[i], we predict reward from imagined_hidden_states[i] (state before action)
-    # We use indices 0..horizon-1 to predict rewards for actions 0..horizon-1
-    hidden_before_actions = imagined_hidden_states[:, :horizon, :]  # (B, horizon, d_model)
+    def loss_fn(p):
+        # Unpack params
+        val_params = p["val"]
+        pi_params = p["pi"]
+        
+        # Bind params into model variables
+        val_vars_local = {**val_vars, "params": val_params}
+        pi_vars_local = {**pi_vars, "params": pi_params}
+        
+        # Split rng for dropout
+        rng_rew, rng_val, rng_pi = jax.random.split(rng_key, 3)
+
+        # reward prediction. we skip the initial timestep since it has invalid reward / value to predict.
+        rw_logits, centers_log_rw = reward_head.apply(
+            rew_vars,
+            imagined_hidden_states[:, 1:, :],  # (B, horizon, d_model),
+            rngs={"dropout": rng_rew},
+            deterministic=False,
+        )  # rew_logits: (B, horizon, K), centers_log_rew: (K,)
+
+        probs_rw = jax.nn.softmax(rw_logits[:, :, 0, :], axis=-1)  # (B, horizon, K)
+        exp_symlog_rw = jnp.sum(probs_rw * centers_log_rw[None, None, :], axis=-1)  # (B, horizon)
+        rewards = _symexp(exp_symlog_rw)  # (B, horizon), starting at t=1
+        
+        # ========== Value Head ==========
+        val_logits, centers_log_val = value_head.apply(
+            val_vars_local,
+            imagined_hidden_states,
+            rngs={"dropout": rng_val},
+            deterministic=False,
+        )  # val_logits: (B, horizon + 1, K), centers_log_val: (K,)
+        
+        # Decode predicted values (expectation in symlog space)
+        probs_val = jax.nn.softmax(val_logits, axis=-1)  # (B, horizon+1, K)
+        exp_symlog_val = jnp.sum(probs_val * centers_log_val[None, None, :], axis=-1)
+        values = _symexp(exp_symlog_val)  # (B, horizon + 1) - values at states 1..horizon
     
-    rw_logits, centers_log_rw = reward_head.apply(
-        rew_vars,
-        hidden_before_actions,  # (B, horizon, d_model) - states before taking actions
-        deterministic=True
-    )  # rw_logits: (B, horizon, L, K), centers_log_rw: (K,)
-    
-    # Decode predicted rewards (expectation in symlog space)
-    # Use offset 0 (next step reward)
-    o1 = 0
-    o1 = min(o1, rw_logits.shape[2] - 1)  # ensure valid offset
-    probs_rw = jax.nn.softmax(rw_logits[:, :, o1, :], axis=-1)  # (B, horizon, K)
-    exp_symlog_rw = jnp.sum(probs_rw * centers_log_rw[None, None, :], axis=-1)  # (B, horizon)
-    rewards = _symexp(exp_symlog_rw)  # (B, horizon)
-    
-    # Compute values for all states (including starting state and all imagined states)
-    # Values are predicted for states, so we use all hidden states
-    val_logits, centers_log_val = value_head.apply(
-        val_vars,
-        imagined_hidden_states,  # (B, horizon + 1, d_model)
-        deterministic=True
-    )  # val_logits: (B, horizon + 1, K), centers_log_val: (K,)
-    
-    # Decode predicted values (expectation in symlog space)
-    probs_val = jax.nn.softmax(val_logits, axis=-1)  # (B, horizon + 1, K)
-    exp_symlog_val = jnp.sum(probs_val * centers_log_val[None, None, :], axis=-1)  # (B, horizon + 1)
-    values = _symexp(exp_symlog_val)  # (B, horizon + 1)
-    
-    # Compute TD(lambda) returns backwards from the end
-    # Formula: R^λ_t = r_t + γ * ((1-λ) * v_{t+1} + λ * R^λ_{t+1})
-    # At the last timestep: R^λ_{horizon-1} = r_{horizon-1} + γ * v_{horizon}
-    # Then work backwards: R^λ_t = r_t + γ * ((1-λ) * v_{t+1} + λ * R^λ_{t+1})
-    
-    # Use scan to compute backwards (JAX-compatible)
-    # We'll scan from the end, carrying the next return value
-    def backward_step(carry, t_reversed):
-        """
-        carry: next_return (B,) - R^λ_{t+1} where t+1 is the next timestep in forward order
-        t_reversed: timestep index in reverse order (horizon-2, horizon-3, ..., 0)
-        returns: (next_return, current_return) where current_return = R^λ_t
-        """
-        # Convert reverse index to forward index
-        t = horizon - 2 - t_reversed  # maps [0, 1, ..., horizon-2] to [horizon-2, horizon-3, ..., 0]
-        next_return = carry  # R^λ_{t+1}
-        next_value = values[:, t + 1]  # v_{t+1}
-        blended = (1.0 - lambda_) * next_value + lambda_ * next_return
-        current_return = rewards[:, t] + gamma * blended  # R^λ_t
-        return current_return, current_return
-    
-    # Initialize with the last timestep return: R^λ_{horizon-1} = r_{horizon-1} + γ * v_{horizon}
-    init_return = rewards[:, horizon - 1] + gamma * values[:, horizon]
-    
-    # Scan backwards: process timesteps [horizon-2, horizon-3, ..., 0]
-    if horizon > 1:
-        # Create scan indices [0, 1, ..., horizon-2] which will map to [horizon-2, ..., 0] in the function
-        scan_indices = jnp.arange(horizon - 1)  # [0, 1, ..., horizon-2]
-        _, td_returns_reversed = jax.lax.scan(
-            backward_step,
-            init_return,
-            scan_indices,
+        # Create twohot targets for TD(lambda) returns
+        # R^λ[t] = r[t+1] + gamma * ((1-lambda) * v[t+1] + lambda * R^λ[t+1]), and R^λ[T] = v[T]
+        def step(carry, inputs):
+            G_next = carry
+            r_t1, v_t1 = inputs
+            G_t = r_t1 + gamma * ((1-lambda_) * v_t1 + lambda_ * G_next)
+            return G_t, G_t
+
+        r_rev = rewards[:, ::-1] # (B, T): r_T...r_1
+        v_next = values[:, 1:]
+        v_next_rev = v_next[:, ::-1] # (B, T): V(s_T...s_1)
+        _, G_rev = jax.lax.scan(
+            step, 
+            values[:, -1],
+            (r_rev.T, v_next_rev.T)
         )
-        # scan returns shape (horizon-1, B), transpose to (B, horizon-1)
-        td_returns_reversed = td_returns_reversed.T  # (B, horizon-1)
-        # td_returns_reversed is in order [R^λ_{horizon-2}, R^λ_{horizon-3}, ..., R^λ_0] per batch
-        # Reverse along time axis to get [R^λ_0, R^λ_1, ..., R^λ_{horizon-2}]
-        td_returns_rest = jnp.flip(td_returns_reversed, axis=1)  # (B, horizon-1)
-        # Concatenate with the last return: [R^λ_0, ..., R^λ_{horizon-2}, R^λ_{horizon-1}]
-        td_lambda_returns = jnp.concatenate([td_returns_rest, init_return[:, None]], axis=1)  # (B, horizon)
-    else:
-        # Edge case: horizon == 1
-        td_lambda_returns = init_return[:, None]  # (B, 1)
+        td_returns = rearrange(G_rev[::-1], 'T B -> B T') # (B, horizon)
+        twohot_targets = jax.lax.stop_gradient(_twohot_symlog_targets(td_returns, centers_log_val))  # (B, horizon, K)
     
-    return rewards, values, td_lambda_returns
+        # Cross-entropy loss: -sum_t log p_θ(R^λ_t | s_t)
+        logq_val = jax.nn.log_softmax(val_logits[:, :-1], axis=-1) # (B, horizon, K)
+        val_ce = -jnp.sum(twohot_targets * logq_val, axis=-1)  # (B, horizon)
+        val_loss = jnp.mean(val_ce)  # scalar
+        
+        # ========== Policy Head Loss (PMPO) ==========
+        # Compute advantages: A_t = R^λ_t - v_t
+        advantages = jax.lax.stop_gradient(td_returns - values[:, :-1])  # (B, horizon)
+        pi_logits = policy_head.apply(
+            pi_vars_local,
+            imagined_hidden_states[:, :horizon, :],
+            rngs={"dropout": rng_pi},
+            deterministic=False,
+        )  # (B, horizon, L, A)
+        # Extract logits for first token (L=0) for action prediction
+        pi_logits_t0 = pi_logits[:, :, 0, :]  # (B, horizon, A)
+        logp_pi = jax.nn.log_softmax(pi_logits_t0, axis=-1)  # (B, horizon, A)
+        
+        # Get log probabilities of actual actions
+        A = logp_pi.shape[-1]
+        actions_onehot = jax.nn.one_hot(imagined_actions, A)  # (B, horizon, A)
+        logp_actions = jnp.sum(actions_onehot * logp_pi, axis=-1)  # (B, horizon)
+        
+        # Flatten across batch and time for PMPO
+        logp_flat = rearrange(logp_actions, 'B T -> (B T)')  # (B*horizon,)
+        advantages_flat = rearrange(advantages, 'B T -> (B T)')  # (B*horizon,)
+
+        # Split into positive and negative sets
+        mask_positive = advantages_flat >= 0  # (B*horizon,)
+        mask_negative = advantages_flat < 0  # (B*horizon,)
+
+        # Compute positive and negative losses
+        # Loss = (1-α)/|D-| * sum_{D-} log π(a|s) - α/|D+| * sum_{D+} log π(a|s)
+        n_positive = jnp.sum(mask_positive)
+        n_negative = jnp.sum(mask_negative)
+        N = B * horizon
+
+        # Negative set loss: maximize log prob (minimize negative log prob)
+        loss_negative = jnp.where(
+            n_negative > 0,
+            (1 - alpha) * jnp.sum(jnp.where(mask_negative, logp_flat, 0.0)) / n_negative,
+            0.0
+        )
+
+        # Positive set loss: minimize log prob (maximize negative log prob)
+        loss_positive = jnp.where(
+            n_positive > 0,
+            -alpha * jnp.sum(jnp.where(mask_positive, logp_flat, 0.0)) / n_positive,
+            0.0
+        )
+
+        # KL divergence with BC policy (behavioral prior)
+        # Get BC policy logits for the same states
+        pi_bc_logits = policy_head_bc.apply(
+            pi_bc_vars,
+            imagined_hidden_states[:, :horizon, :],
+            deterministic=True,  # BC policy is frozen, no dropout needed
+        )  # (B, horizon, L, A)
+        pi_bc_logits_t0 = pi_bc_logits[:, :, 0, :]  # (B, horizon, A)
+        logp_bc = jax.nn.log_softmax(pi_bc_logits_t0, axis=-1)  # (B, horizon, A)
+
+        # KL divergence: KL[π_θ || π_prior] = sum_a π_θ(a|s) * log(π_θ(a|s) / π_prior(a|s))
+        # = sum_a π_θ(a|s) * (log π_θ(a|s) - log π_prior(a|s))
+        p_pi = jax.nn.softmax(pi_logits_t0, axis=-1)  # (B, horizon, A)
+        kl_per_state = jnp.sum(p_pi * (logp_pi - logp_bc), axis=-1)  # (B, horizon)
+        kl_loss = beta * jnp.mean(kl_per_state)  # scalar
+
+        # Total policy loss
+        pi_loss = loss_negative + loss_positive + kl_loss      
+        # Total loss
+        total_loss = val_loss + pi_loss
+        aux = {
+            "val_loss": val_loss,
+            "pi_loss": pi_loss,
+            "pi_loss_negative": loss_negative,
+            "pi_loss_positive": loss_positive,
+            "pi_kl_loss": kl_loss,
+            "n_positive": n_positive,
+            "n_negative": n_negative,
+            "mean_advantage": jnp.mean(advantages),
+            "mean_td_return": jnp.mean(td_returns),
+        }
+
+        return total_loss, aux
+    
+    # Compute gradients and update
+    (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    updates, new_opt_state = tx.update(grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+    
+    return new_params, new_opt_state, aux
 
 # ---------------------------
 # Main
@@ -952,6 +1094,7 @@ def run(cfg: RLConfig):
 
 
         # TODO: refactor imagine rollouts so that it is JITable.
+        # TODO: merge imagine rollouts into train_step, otherwise policy head is called twice.
         imagined_latents, imagined_actions, imagined_hidden_states = imagine_rollouts(
             dynamics=train_state.dynamics,
             task_embedder=train_state.task_embedder,
@@ -969,53 +1112,86 @@ def run(cfg: RLConfig):
             d=cfg.imagination_d,
             start_mode="pure",
             rng_key=imag_key,
-        )
-        
-        # Score rollouts: compute rewards, values, and TD(lambda) returns
-        rewards, values, td_lambda_returns = score_rollouts(
-            imagined_hidden_states=imagined_hidden_states,
+        )    
+        # Training step: update value head and policy head
+        train_rng, train_step_key = jax.random.split(train_rng)
+        new_params, new_opt_state, aux = train_step(
             reward_head=train_state.reward_head,
             value_head=train_state.value_head,
+            policy_head=train_state.policy_head,
+            policy_head_bc=train_state.policy_head_bc,
+            tx=train_state.tx,
+            params=train_state.params,
+            opt_state=train_state.opt_state,
             rew_vars=train_state.rew_vars,
             val_vars=train_state.val_vars,
+            pi_vars=train_state.pi_vars,
+            pi_bc_vars=train_state.pi_bc_vars,
+            imagined_hidden_states=imagined_hidden_states,
+            imagined_actions=imagined_actions,
+            horizon=cfg.horizon,
             gamma=cfg.gamma,
             lambda_=cfg.lambda_,
-            horizon=cfg.horizon,
+            alpha=cfg.alpha,
+            beta=cfg.beta,
+            rng_key=train_step_key,
         )
         
-    
-        # TODO: Implement training step
-        # - Train value_head to predict TD(lambda) returns
-        # - Train policy_head using PMPO (sign of advantages A_t = R^λ_t - v_t)
-        # - Apply behavioral prior regularization (KL divergence from policy_head_bc)
+        # Update train_state with new params and opt_state
+        train_state.params = new_params
+        train_state.opt_state = new_opt_state
+        
+        # Update val_vars and pi_vars with new params
+        train_state.val_vars = {**train_state.val_vars, "params": new_params["val"]}
+        train_state.pi_vars = {**train_state.pi_vars, "params": new_params["pi"]}
         
         if step % cfg.log_every == 0:
-            print(f"[train] step={step:06d} | TODO: Implement training step")
+            print(f"[train] step={step:06d} | "
+                  f"val_loss={aux['val_loss']:.4f} | "
+                  f"pi_loss={aux['pi_loss']:.4f} | "
+                  f"pi_neg={aux['pi_loss_negative']:.4f} | "
+                  f"pi_pos={aux['pi_loss_positive']:.4f} | "
+                  f"pi_kl={aux['pi_kl_loss']:.4f} | "
+                  f"mean_adv={aux['mean_advantage']:.4f} | "
+                  f"mean_td_return={aux['mean_td_return']:.4f} | "
+                  f"n_pos={int(aux['n_positive'])}/{int(aux['n_positive'] + aux['n_negative'])}")
             
             if cfg.use_wandb and WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({"step": step}, step=step)
+                wandb.log({
+                    "step": step,
+                    "val_loss": float(aux["val_loss"]),
+                    "pi_loss": float(aux["pi_loss"]),
+                    "pi_loss_negative": float(aux["pi_loss_negative"]),
+                    "pi_loss_positive": float(aux["pi_loss_positive"]),
+                    "pi_kl_loss": float(aux["pi_kl_loss"]),
+                    "mean_advantage": float(aux["mean_advantage"]),
+                    "mean_td_return": float(aux["mean_td_return"]),
+                    "n_positive": int(aux["n_positive"]),
+                    "n_negative": int(aux["n_negative"]),
+                }, step=step)
       
+        # TODO: figure out visualization logic. Periodically rollout the policy. 
         # Visualize imagined rollouts (decode latents to frames and display scores)
-        if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
-            visualize_imagined_rollouts(
-                imagined_latents=imagined_latents,
-                imagined_actions=imagined_actions,
-                rewards=rewards,
-                values=values,
-                td_lambda_returns=td_lambda_returns,
-                decoder=train_state.decoder,
-                dec_vars=train_state.dec_vars,
-                n_spatial=n_spatial,
-                packing_factor=cfg.packing_factor,
-                H=cfg.H,
-                W=cfg.W,
-                C=cfg.C,
-                patch=patch,
-                horizon=cfg.horizon,
-                vis_dir=vis_dir,
-                step=step,
-                max_examples=4,
-            )      
+        # if cfg.visualize_every > 0 and step % cfg.visualize_every == 0:
+        #     visualize_imagined_rollouts(
+        #         imagined_latents=imagined_latents,
+        #         imagined_actions=imagined_actions,
+        #         rewards=rewards,
+        #         values=values,
+        #         td_lambda_returns=td_lambda_returns,
+        #         decoder=train_state.decoder,
+        #         dec_vars=train_state.dec_vars,
+        #         n_spatial=n_spatial,
+        #         packing_factor=cfg.packing_factor,
+        #         H=cfg.H,
+        #         W=cfg.W,
+        #         C=cfg.C,
+        #         patch=patch,
+        #         horizon=cfg.horizon,
+        #         vis_dir=vis_dir,
+        #         step=step,
+        #         max_examples=4,
+        #     )      
         # Save checkpoint
         state = make_state(train_state.params, train_state.opt_state, train_rng, step)
         maybe_save(mngr, step, state, meta)
