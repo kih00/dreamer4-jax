@@ -23,7 +23,7 @@ from utils import (
     with_params, make_state, make_manager, try_restore, pack_mae_params,
 )
 
-from sampler_unified import SamplerConfig, sample_video, _signal_idx_from_tau
+from sampler_old import SamplerConfig, sample_video, _signal_idx_from_tau
 
 
 # ---------------------------

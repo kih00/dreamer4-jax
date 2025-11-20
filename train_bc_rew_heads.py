@@ -35,7 +35,7 @@ from utils import (
     pack_mae_params,
 )
 
-from sampler_unified import SamplerConfig, sample_video
+from sampler_old import SamplerConfig, sample_video
 
 # ---------------------------
 # Config

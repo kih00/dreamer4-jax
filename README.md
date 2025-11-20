@@ -13,6 +13,8 @@ The high level plan is to first implement the entire algorithm, and validate on 
 
 Then, train and deploy on a more serious benchmark from Jasmine.
 
+See implementation progress log [here](https://docs.google.com/presentation/d/1Hc5E-KDZjBwd4HNpFpNoYiuJJTXs15PEDJzw_-VBX3E/edit?usp=sharing).
+
 <details>
 <summary><b>Detailed Roadmap</b></summary>
 <br>
@@ -52,6 +54,11 @@ Then, train and deploy on a more serious benchmark from Jasmine.
         - [x] Finetune WM on actions and rewards
             - [x] proper handling of terminations, initial rewards, etc.
     - [ ] RL Training
+        - [x] Initial PMPO update step
+        - [x] Visualization helpers for verifying imagination rollouts
+        - [x] Speed up imagination generation through JIT
+        - [ ] Completely fuse all operations into one train step for JIT
+        - [ ] Imagination KV caching
 - [ ] Small offline RL dataset generation (Atari-5 or Craftax)
 </details>
 
@@ -152,3 +159,41 @@ Did a fair amount of debugging to improve generations. The way I was doing sampl
 Then, the interactive dynamics transformer is finetuned on action and reward prediction losses. The predicted actions and rewards look fairly accurate over the autoregressive rollout.
 
 ### RL in imagination
+TD-lambda return computation.
+
+We follow the Dreamer convention of indexing for transitions, where starting at state t, we execute action *t+1* and get reward *t+1* and next state *t+1*. So the transition tuple is indexed as (s[t], a[t+1], r[t+1], s[t+1]) instead of the typical (s[t], a[t], r[t], s[t+1]). Here's the example.
+```
+# reset the env. a0, r0, d0 are all "null".
+T=0: a0, r0, d0, s0
+Agent takes in s0 and outputs a1. Call env.step(a1) to get next r,d,s
+T=1: a1, r1, d1, s1
+...
+T=T-1: a(T-1), r(T-1), d(T-1), s(T-1)
+Agent takes in s(T-1) and outputs aT. Call env.step(aT) to get next r,d,s.
+T=T: aT, rT, dT, sT
+```
+With this notation in mind, all initial (T=0) actions, rewards, and dones should be marked invalid and ignored during reward prediction, action prediction, value learning, etc. 
+
+Now, our goal is to compute advantages to train the policy. We define the advantage as the TD-lambda return R(s[t], a[t+1]) minus the value V(s[t]). 
+Let's say we have an imagination rollout `(s0, a1, s1, a2, s2, ... s[T-1], aT, sT)`, and the corresponding rewards r[t], values v[t], and hidden states h[t]. 
+
+Then, we compute TD-lambda returns from T to 0 like so:
+```
+for t in range(T-1, -1, -1):
+    R[t] = r[t+1] + γ * ((1-λ) * v[t+1] + λ * R[t+1])
+
+which looks like:
+R[T] = v[T]
+R[T-1] = r[T]   + γ * ((1-λ) * v[T]   + λ * R[T])
+...
+R[0]   = r[1]   + γ * ((1-λ) * v[1]   + λ * R[1])
+```
+
+
+Then, we can use the TD-lambda returns `R[0...T-1]` to supervise the value prediction head for timesteps 0...T-1, like:
+`v[0...T-1] = predict => R[0...T-1]`. Note that we don't include T, since that's just doing `v[T] = predict => v[T]` which is useless.
+
+
+Then, we call the policy head over all of the hidden states `h[0...T-1]` to get their actions `A` which is an array of length T. But remember these actions will actually correspond to the timesteps 1...T, that is `A[0] = a1`. We skip calling the policy on `h[T]` since we don't have supervision signal for the action `a[T+1]`. 
+
+Then, let's think about how to correspond which TD-lambda return with which action for the PMPO update. `R[0]` is the predicted return from starting at `s0`, executing `a1`, and receiving `r1` as the reward and `s1` as the next state. Then, this means we should correspond `R[0]` with the action `a1` which is actually the first element in `A`. So then it should be straightforward `A[0...T]` gets supervised with `R[0....T]`.
