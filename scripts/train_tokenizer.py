@@ -2,13 +2,13 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import optax
-from models import Encoder, Decoder
-from data import make_iterator
+from dreamer.models import Encoder, Decoder
+from dreamer.data import make_iterator
 import imageio
 from jaxlpips import LPIPS
 from pathlib import Path
 from time import time
-from utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
+from dreamer.utils import temporal_patchify, temporal_unpatchify, make_state, make_manager, try_restore, maybe_save, pack_mae_params, unpack_mae_params
 
 
 
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     # data
     _next_batch = make_iterator(B, T, H, W, C, pixels_per_step, size_min, size_max, hold_min, hold_max)
     def next_batch(rng):
-        rng, (videos, actions) = _next_batch(rng)
+        rng, (videos, actions, rewards) = _next_batch(rng)
         return rng, videos
 
     rng, batch_rng = jax.random.split(rng)

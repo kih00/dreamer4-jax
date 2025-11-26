@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from data import patchify, unpatchify
+from dreamer.data import patchify, unpatchify
 import orbax.checkpoint as ocp
 from pathlib import Path
 from flax.core import freeze, unfreeze, FrozenDict

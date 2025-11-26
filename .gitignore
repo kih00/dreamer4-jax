@@ -1,6 +1,8 @@
 logs/
 overfit_exps/
 *.out
+slurm_outs/
+run_job.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

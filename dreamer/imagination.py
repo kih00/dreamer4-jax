@@ -1,4 +1,4 @@
-# sampler_jit.py - JIT-friendly image / video sampling for the dynamics model.
+# imagination.py - JIT-friendly image / video sampling for the dynamics model during RL.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,8 +13,8 @@ import imageio
 import matplotlib.pyplot as plt
 import time
 
-from models import Dynamics, TaskEmbedder
-from utils import (
+from dreamer.models import Dynamics, TaskEmbedder
+from dreamer.utils import (
     temporal_patchify,
     temporal_unpatchify,
     pack_bottleneck_to_spatial,
@@ -631,8 +631,8 @@ def _make_real_world_models_and_batch():
 
     Uses the same checkpoint paths and initialization logic as train_policy.py.
     """
-    from data import make_iterator
-    from train_policy import RLConfig, initialize_models
+    from dreamer.data import make_iterator
+    from scripts.train_policy import RLConfig, initialize_models
 
     # This mirrors the __main__ config in train_policy.py but you can
     # adjust the batch/time dimensions here if desired.

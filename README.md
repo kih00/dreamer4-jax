@@ -1,199 +1,138 @@
-# Dreamer 4 in pure Jax
+# Dreamer 4 World Models, in pure JAX
 
-This is an unofficial implementation of the [Dreamer 4](https://danijar.com/project/dreamer4/) world model in the paper "Training Agents Inside of Scalable World Models".
+This repo is an unofficial implementation of the **[Dreamer 4](https://danijar.com/project/dreamer4/)** world model and RL agent from *“Training Agents Inside of Scalable World Models”* in pure JAX. This repo is designed to be educational and serve as a starting point for those interested in world models, RL, and Jax. 
+
+![dreamer4](docs/architecture.png)
+
+At this stage, the entire world model + RL pipeline has been implemented and verified on a small bouncing square dataset. The authors are extending the codebase to solve harder tasks like CoinRun and eventually, Minecraft.  
+
+> [!NOTE]
+> We are looking for support - in terms of compute, advising, or feature development. Please get in touch if interested!
+
 
 - [Website](https://danijar.com/project/dreamer4/)
 - [Twitter](https://x.com/danijarh/status/1973072288351396320)
 
-## Roadmap
-The high level plan is to first implement the entire algorithm, and validate on a toy dataset.
-- [x] Causal Tokenizer
-- [x] Interactive Dynamics Model
-- [ ] Imagination Training 
+## Demo
 
-Then, train and deploy on a more serious benchmark from Jasmine.
+At a high level, Dreamer 4 first trains an action-conditioned video diffusion model of the environment. Here, we show that the world model has learned to accurately predict the real dynamics of the bouncing square dataset.
+<figure>
+    <img src="docs/imagination-cropped.gif">
+</figure>
 
-See implementation progress log [here](https://docs.google.com/presentation/d/1Hc5E-KDZjBwd4HNpFpNoYiuJJTXs15PEDJzw_-VBX3E/edit?usp=sharing).
 
-<details>
-<summary><b>Detailed Roadmap</b></summary>
-<br>
+Then, the agent is trained with RL in the world model. The reward is the proximity to the center of the image. We can see that the agent successfully learns to hover near the center.
+<figure>
+    <img src="docs/rl-cropped.gif">
+</figure>
 
-- [x] Toy Video Dataset generation
-- [x] Causal Tokenizer
-    - [x] Space-time Axial Attention
-    - [x] MAE encoder decoder 
-    - [x] MSE loss
-    - [x] Training loop
-    - [x] LPIPS loss
-    - [x] checkpointing
-    - [ ] Minor improvements
-        - [ ] wandb logging
-        - [ ] cli args / config 
-        - [ ] RoPE
-        - [x] SwiGLU
-        - [ ] GQA
-- [ ] Interactive Dynamics Model
-    - [x] Add actions to Toy Video Dataset
-    - [x] Add multi-modality support for efficient transformer block
-    - [x] setup architecture
-        - [x] need to generalize tokenizer preprocessing logic
-        - [x] need a "null" action
-        - [ ] key / value caching for faster generation
-            - [ ] K/V cache across diffusion sampling
-            - [ ] K/V cache across timesteps
-    - [x] training loop
-        - [x] data loading, need to import an encoder and forward the data.
-        - [x] shortcut loss function 
-        - [x] visualization of predictions
-        - [x] optimized loss function 
-        - [x] proper checkpointing and loading encoder weights
-- [ ] Imagination training 
-    - [x] Behavior cloning and reward model
-        - [x] Update dynamics model architecture to take in agent tokens.
-        - [x] Finetune WM on actions and rewards
-            - [x] proper handling of terminations, initial rewards, etc.
-    - [ ] RL Training
-        - [x] Initial PMPO update step
-        - [x] Visualization helpers for verifying imagination rollouts
-        - [x] Speed up imagination generation through JIT
-        - [ ] Completely fuse all operations into one train step for JIT
-        - [ ] Imagination KV caching
-- [ ] Small offline RL dataset generation (Atari-5 or Craftax)
-</details>
 
-## Installation
-Use `uv` to create the virtual environment and install dependencies:
+
+## Repo Structure
+- **Core library (`dreamer/`)**
+  - `models.py` -- Space-time axial attention, causal tokenizer, interactive dynamics model, agent / reward / value heads.
+  - `data.py` -- Bouncing square dataset and environment 
+  - `imagination.py` -- JIT-fused imagination / diffusion-style rollout code used for fast RL in latent space.
+  - `sampler.py` - non-JIT sampling helpers for debugging / visualization.
+  - `utils.py` -- training state helpers, checkpointing wrappers (Orbax), logging helpers.
+- **Training & evaluation scripts (`scripts/`)**
+  - `train_tokenizer.py` -- Trains the causal tokenizer (masked autoencoder over video).
+  - `train_dynamics.py` -- Trains the interactive dynamics model on top of the frozen tokenizer.
+  - `train_bc_rew_heads.py` -- Adds behavior cloning and reward prediction heads on the world model (agent tokens + reward head).
+  - `train_policy.py` -- Runs Dreamer‑style RL purely in imagination using the learned world model and heads (PMPO-style update).
+  - `eval_bc_rew_heads.py` -- Evaluation script to verify BC / reward finetuning
+- **Docs & logs**
+  - `docs/` -- Figures, videos, and notes from development (e.g., reconstructions, imagination rollouts).
+
+This repo is intentionally built to be easy to modify. If you want to understand or change the algorithm, start from the training scripts under `scripts/` and follow the calls into `dreamer/`.
+
+## Setup
+
+We use `uv` to manage the environment and dependencies (see `pyproject.toml` / `uv.lock`):
+
 ```bash
-uv sync      # creates .venv and installs packages from uv.lock
-source .venv/bin/activate
-```
-By default, this installs the CPU version of jax. Follow the instructions in the Jax repo to install the GPU version (e.g. `uv pip install "jax[cuda12]"`).
-
-## Dataset generation
-
-For now, we are generating bouncing square dataset in `data.py`. It outputs a (B,T,H,W,C) batch of data.
-
-We follow the Dreamer convention of indexing for transitions, in which action $a_i$ happens *before* $s_i$. The MDP executes like so:
-```
-# reset the env. a0, r0, d0 are all "null".
-T=0: a0, r0, d0, s0
-Agent takes in s0 and outputs a1. Call env.step(a1) to get next r,d,s
-T=1: a1, r1, d1, s1
-...
-T=T-1: a(T-1), r(T-1), d(T-1), s(T-1)
-Agent takes in s(T-1) and outputs aT. Call env.step(aT) to get next r,d,s.
-T=T: aT, rT, dT, sT
-```
-With this notation in mind, all initial (T=0) actions, rewards, and dones should be marked invalid and ignored during reward prediction, action prediction, value learning, etc. 
-
-
-<img src="docs/video.gif" width="500px">
-- frames: (B,T,H,W,C), normalized between 0 and 1
-- actions: (B,T,|A|), first timestep has dummy action
-- rewards: (B, T), reward data, first timestep has dummy reward
-- task: (B,), task ID as an integer
-
- 
-## Causal Tokenizer
-The Causal Tokenizer learns the representation for Dreamer 4.
-
-<img src="docs/step_75900.png" width="300px">
-
-From top to bottom we have: 2 images, their masked variants that are fed to the encoder, then 4 decoder outputs (2 partial decodings, and 2 full decodings). We can see the decoder outputs match the input images well.  
-
-It is a causal transformer encoder, trained through a masked autoencoder loss. Dreamer 4 uses an efficient transformer design which uses axial attention to attend to the space and time dimensions independently. 
-
-
-<details>
-<summary><b>Architecture Details</b></summary>
-<br>
-
-Data variables:
-
-| Variable | Description |
-|----------|-------------|
-| B        | Batch size  |
-| T        | Number of timesteps in the video sequence |
-| H        | Height of the video frames |
-| W        | Width of the video frames |
-| C        | Number of channels in the video frames (e.g., 3 for RGB) |
-| P        | Patch size for patchifying the video frames |
-| N_p      | Number of patches per frame, calculated as (H/P)*(W/P) |
-| D        | Dimensionality of each patch, calculated as P*P*C |
-
-Encoder model settings:
-| Variable | Description |
-|----------|-------------|
-| N_l      | Number of latent tokens |
-| D_bottleneck | Dimensionality of the bottleneck space |
-
-
-
-Data to Encoder steps:
-1. Take in video data of shape (B, T, H, W, C). 
-2. Patchify with patches of size P, to $(B, T, H/P, W/P, C)$, and then flatten the patches to a sequence $(B, T, N_p, D)$ where $N_p = (H/P)*(W/P)$ and $D = P*P*C$.
-3. Prepend learnable latent tokens before each patch token in each timestep to get a batch of sequences, shape $(B, T,  N_l + N_p, D)$, where $N_l$ is the number of latent tokens.
-4. Spatial attention: First, let's zoom in on just one timestep with its $N_l$ latent tokens and $N_p$ patch tokens. We do full attention over these tokens. Now, zooming out, this is done on each timestep independently. 
-5. Then, we perform causal attention over just the $N_l$ latent tokens to aggregate info across time. In practice, we do causal attention only once every 4 spatial attention layers, to save computation. 
-6. Then, we project the last attention block's latent tokens into a lower dimensional bottleneck space, using a linear projection and a tanh. This is the $z$ space in the paper.
-
-Then, we train the $z$ representation using a decoder. The decoder is also a transformer, using the same axial attention idea. 
-1. Take in the sequence of $z$ tokens, of shape $(B, T, N_l, D_\text{bottleneck})$. Prepend learnable patch query tokens to each timestep, to get shape $(B, T, N_l + N_p, D_\text{bottleneck})$.
-2. Do spatial attention over the $N_l + N_p$ tokens at each timestep independently, then do causal attention over the $N_l$ latent tokens every 4 layers.
-3. Finally, project the patch query tokens back to pixel space using a linear layer, and unpatchify to get back to $(B, T, H, W, C)$.
-</details>
-
-
-
-
-### Training the Causal Tokenizer
-The causal tokenizer is trained using a masked autoencoder loss. We randomly mask out a portion of the input patches with probability $U(0, 0.9)$, and replace the missing portion with a learnable embedding. We then pass the masked input through the encoder and decoder, and train the model with reconstruction loss (MSE) between the original and reconstructed images.
-
-## Interactive Dynamics 
-- need to make sure we are handling multiple modalities correctly, where latent tokens can read from everything but other tokens can only attend amongst tokens with the same modality 
-
-Did a fair amount of debugging to improve generations. The way I was doing sampling was incorrect, now the quality is a lot better. We need a variable step size to account for the signal level. Now, we are fairly sure the generation is working since we're able to get almost pixel perfect predictions on the bouncing square dataset.
-
-### Reward / Action prediction
-Then, the interactive dynamics transformer is finetuned on action and reward prediction losses. The predicted actions and rewards look fairly accurate over the autoregressive rollout.
-
-### RL in imagination
-TD-lambda return computation.
-
-We follow the Dreamer convention of indexing for transitions, where starting at state t, we execute action *t+1* and get reward *t+1* and next state *t+1*. So the transition tuple is indexed as (s[t], a[t+1], r[t+1], s[t+1]) instead of the typical (s[t], a[t], r[t], s[t+1]). Here's the example.
-```
-# reset the env. a0, r0, d0 are all "null".
-T=0: a0, r0, d0, s0
-Agent takes in s0 and outputs a1. Call env.step(a1) to get next r,d,s
-T=1: a1, r1, d1, s1
-...
-T=T-1: a(T-1), r(T-1), d(T-1), s(T-1)
-Agent takes in s(T-1) and outputs aT. Call env.step(aT) to get next r,d,s.
-T=T: aT, rT, dT, sT
-```
-With this notation in mind, all initial (T=0) actions, rewards, and dones should be marked invalid and ignored during reward prediction, action prediction, value learning, etc. 
-
-Now, our goal is to compute advantages to train the policy. We define the advantage as the TD-lambda return R(s[t], a[t+1]) minus the value V(s[t]). 
-Let's say we have an imagination rollout `(s0, a1, s1, a2, s2, ... s[T-1], aT, sT)`, and the corresponding rewards r[t], values v[t], and hidden states h[t]. 
-
-Then, we compute TD-lambda returns from T to 0 like so:
-```
-for t in range(T-1, -1, -1):
-    R[t] = r[t+1] + γ * ((1-λ) * v[t+1] + λ * R[t+1])
-
-which looks like:
-R[T] = v[T]
-R[T-1] = r[T]   + γ * ((1-λ) * v[T]   + λ * R[T])
-...
-R[0]   = r[1]   + γ * ((1-λ) * v[1]   + λ * R[1])
+uv sync      # creates .venv and installs packages
+source .venv/bin/activate # activate venv
+uv pip install -e . # install this project as an editable package
 ```
 
+By default, this installs the **CPU** version of JAX. For GPUs, follow the official JAX instructions, for example:
 
-Then, we can use the TD-lambda returns `R[0...T-1]` to supervise the value prediction head for timesteps 0...T-1, like:
-`v[0...T-1] = predict => R[0...T-1]`. Note that we don't include T, since that's just doing `v[T] = predict => v[T]` which is useless.
+```bash
+uv pip install "jax[cuda12]"
+```
+
+The code should run on any relatively recent GPU, but all logic should also run (more slowly) on CPU.
+
+## Training Pipeline
+Dreamer 4 follows a 4-stage training pipeline.
+- **Phase 1**: Train a causal tokenizer (MAE-style) on videos.
+- **Phase 2**: Train an interactive dynamics model in latent space of the tokenizer.
+- **Phase 3**: Add agent tokens, BC / reward heads with behavior cloning and reward prediction.
+- **Phase 4**: Train a policy on imagination trajectories from the dynamics model.
+
+The default experiments use the synthetic **bouncing square** dataset, where an agent controls a square in a small grid using WASD commands and is rewarded for staying in the center.
+
+To run the training pipeline, edit the configs in each script's `__main__` block and execute:
+
+```bash
+# Phase 1: Train the causal tokenizer
+python scripts/train_tokenizer.py
+
+# Phase 2: Train the dynamics model (requires tokenizer checkpoint)
+python scripts/train_dynamics.py
+# Edit tokenizer_ckpt in the config to point to your Phase 1 checkpoint
+
+# Phase 3: Train BC/reward heads (requires tokenizer + dynamics checkpoints)
+python scripts/train_bc_rew_heads.py
+# Edit tokenizer_ckpt and pretrained_dyn_ckpt in the config
+
+# Phase 4: Train policy in imagination (requires BC/reward checkpoint)
+python scripts/train_policy.py
+# Edit bc_rew_ckpt in the config to point to your Phase 3 checkpoint
+```
+
+All scripts save checkpoints under `logs/{run_name}/checkpoints/` by default. You can also enable wandb logging by setting `use_wandb=True` in the configs.
+
+## Experimental Results
+A log of the training process.
+
+#### MAE training
+The MAE, after training, should have around 40 PSNR, and the visualizations should show perfect reconstruction from masked inputs.
 
 
-Then, we call the policy head over all of the hidden states `h[0...T-1]` to get their actions `A` which is an array of length T. But remember these actions will actually correspond to the timesteps 1...T, that is `A[0] = a1`. We skip calling the policy on `h[T]` since we don't have supervision signal for the action `a[T+1]`. 
+<figure>
+    <img src="docs/step_75900.png">
+  <figcaption>Ground Truth, Masked Input, Reconstructions</figcaption>
+</figure>
 
-Then, let's think about how to correspond which TD-lambda return with which action for the PMPO update. `R[0]` is the predicted return from starting at `s0`, executing `a1`, and receiving `r1` as the reward and `s1` as the next state. Then, this means we should correspond `R[0]` with the action `a1` which is actually the first element in `A`. So then it should be straightforward `A[0...T]` gets supervised with `R[0....T]`.
+#### Dynamics training
+The dynamics model is trained. It should get around ~30 PSNR in the autoregressive generations using diffusion, and ~29 PSNR using shortcut. The generations should look almost pixel perfect.
+
+<figure>
+    <img src="docs/dynamics_training.png">
+  <figcaption>Dynamics model training curves. </figcaption>
+</figure>
+
+#### Reward / BC training
+Agent tokens, Reward / BC heads are trained on top of the dynamics model, and the dynamics model is finetuned to prevent collapse.
+<figure>
+    <img src="docs/bc_rew_training.png">
+  <figcaption>Reward / BC / Dynamics model losses. </figcaption>
+</figure>
+
+#### RL in imagination
+The policy is trained with RL on imagination rollouts from the dynamics model.
+<figure>
+    <img src="docs/rl_training.png">
+  <figcaption>RL training curves. The returns increase and the policy stays in the center. </figcaption>
+</figure>
+
+
+
+## References and Acknowledgements
+This implementation references:
+- **Dreamer 4**: [“Training Agents Inside of Scalable World Models”](https://danijar.com/project/dreamer4/)
+- **Jasmine** ["Jasmine: A simple, performant and scalable JAX-based world modeling codebase"](https://github.com/p-doom/jasmine)
+
+The authors would like to thank Danijar and the Jasmine team (Mihir, Franz, Alfred) for their advice. 

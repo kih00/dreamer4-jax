@@ -1,16 +1,15 @@
-# sampler_old.py
+# sampling logic for debugging / visualization. Not JIT friendly.
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Tuple, Optional, Dict, Any, Callable
-from functools import partial
-from einops import pack, unpack, reduce
+from einops import reduce
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP
-from utils import (
+from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP
+from dreamer.utils import (
     temporal_patchify, temporal_unpatchify,
     pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
 )

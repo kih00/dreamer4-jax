@@ -43,7 +43,7 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
 
-from models import (
+from dreamer.models import (
     Encoder,
     Decoder,
     Dynamics,
@@ -52,12 +52,10 @@ from models import (
     RewardHeadMTP,
     ValueHead,
 )
-from data import make_iterator, make_env_reset_fn, make_env_step_fn
-from utils import (
+from dreamer.data import make_iterator, make_env_reset_fn, make_env_step_fn
+from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
-    unpack_spatial_to_bottleneck,
-    temporal_unpatchify,
     with_params,
     make_state,
     make_manager,
@@ -65,7 +63,7 @@ from utils import (
     maybe_save,
     pack_mae_params,
 )
-from sampler_jit import (
+from dreamer.imagination import (
     ImaginationConfig,
     DenoiseSchedule,
     _build_static_schedule,
@@ -1874,9 +1872,9 @@ def run(cfg: RLConfig):
 
 if __name__ == "__main__":
     cfg = RLConfig(
-        run_name="train_policy_jit_flippedrew2",
+        run_name="train_policy_jit_flippedrew2_test",
         bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
-        use_wandb=True,
+        use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",

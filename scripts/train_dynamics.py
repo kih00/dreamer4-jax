@@ -25,9 +25,9 @@ except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
 
-from models import Encoder, Decoder, Dynamics
-from data import make_iterator
-from utils import (
+from dreamer.models import Encoder, Decoder, Dynamics
+from dreamer.data import make_iterator
+from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     with_params,
@@ -35,7 +35,7 @@ from utils import (
     pack_mae_params,
 )
 
-from sampler_old import SamplerConfig, sample_video
+from dreamer.sampler_old import SamplerConfig, sample_video
 
 # ---------------------------
 # Config
@@ -648,7 +648,7 @@ def run_evaluation(
         vis_dir: Directory for visualization outputs
     """
     val_rng = jax.random.PRNGKey(9999)
-    _, (val_frames, val_actions) = next_batch(val_rng)
+    _, (val_frames, val_actions, _) = next_batch(val_rng)
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params)
     ctx_length = min(32, cfg.T - 1)
     regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
@@ -748,7 +748,7 @@ def run(cfg: RealismConfig):
 
     # Initialize models and restore tokenizer
     init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init) = next_batch(init_rng)
+    _, (frames_init, actions_init, _) = next_batch(init_rng)
 
     train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
 
@@ -791,7 +791,7 @@ def run(cfg: RealismConfig):
     for step in range(start_step, cfg.max_steps + 1):
         # Data
         data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions) = next_batch(batch_key)
+        _, (frames, actions, _) = next_batch(batch_key)
 
         # RNG for this step
         train_rng, master_key = jax.random.split(train_rng)
@@ -865,9 +865,9 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_ndynamics_newattn",
+        run_name="train_dynamics_test",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        use_wandb=True,
+        use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",

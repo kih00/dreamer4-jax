@@ -15,15 +15,14 @@ import matplotlib.pyplot as plt
 import orbax.checkpoint as ocp
 
 # Project imports
-from models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from data import make_iterator
-from utils import (
-    temporal_patchify, temporal_unpatchify,
-    pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck,
-    with_params, make_state, make_manager, try_restore, pack_mae_params,
+from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
+from dreamer.data import make_iterator
+from dreamer.utils import (
+    temporal_patchify, pack_bottleneck_to_spatial, 
+    with_params, make_state, make_manager, pack_mae_params,
 )
 
-from sampler_old import SamplerConfig, sample_video, _signal_idx_from_tau
+from dreamer.sampler_old import SamplerConfig, sample_video
 
 
 # ---------------------------

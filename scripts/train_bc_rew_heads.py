@@ -25,9 +25,9 @@ except ImportError:
     wandb = None
 
 # UPDATED: bring in heads + task embedder
-from models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
-from data import make_iterator
-from utils import (
+from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
+from dreamer.data import make_iterator
+from dreamer.utils import (
     temporal_patchify,
     pack_bottleneck_to_spatial,
     with_params,
@@ -35,7 +35,7 @@ from utils import (
     pack_mae_params,
 )
 
-from sampler_old import SamplerConfig, sample_video
+from dreamer.sampler_old import SamplerConfig, sample_video
 
 # ---------------------------
 # Config
@@ -1067,10 +1067,10 @@ def run(cfg: RealismConfig):
 
 if __name__ == "__main__":
     cfg = RealismConfig(
-        run_name="train_bc_rew_flippedrew",
+        run_name="train_bc_rew_flippedrew_test",
         tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
         pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
-        use_wandb=True,
+        use_wandb=False,
         wandb_entity="edhu",
         wandb_project="tiny_dreamer_4",
         log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
