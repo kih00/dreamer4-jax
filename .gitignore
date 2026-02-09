@@ -223,3 +223,6 @@ __marimo__/
 
 # slurm files
 slurm/
+
+# wandb files
+wandb/

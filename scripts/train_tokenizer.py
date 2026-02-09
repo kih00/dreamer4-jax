@@ -1,6 +1,6 @@
-from __future__ import annotations
 from dataclasses import dataclass, asdict
 from functools import partial
+from typing import Optional
 import pprint
 import jax
 import jax.numpy as jnp
@@ -29,9 +29,9 @@ class TokenizerConfig:
 
     # wandb config
     use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-    wandb_group: str | None = None
+    wandb_entity: Optional[str] = None
+    wandb_project: Optional[str] = None
+    wandb_group: Optional[str] = None
 
     # data
     B: int = 32
@@ -285,6 +285,7 @@ def run(cfg: TokenizerConfig):
             project=cfg.wandb_project,
             name=cfg.run_name,
             group=cfg.wandb_group,
+            dir=str(Path(cfg.log_dir).resolve()),
         )
         print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
 
@@ -350,7 +351,10 @@ def run(cfg: TokenizerConfig):
 
     # LPIPS initialization (once)
     print("Initializing LPIPS...")
-    lpips_fn = LPIPS(pretrained_network="alexnet") if cfg.lpips_weight > 0.0 else None
+    lpips_fn = (
+        LPIPS(pretrained_network="alexnet")  # or "vgg", "squeeze"
+        if cfg.lpips_weight > 0.0 else None
+    )
 
     # optim
     params = pack_mae_params(enc_vars, dec_vars)
@@ -427,12 +431,12 @@ def run(cfg: TokenizerConfig):
 
                 if cfg.use_wandb and wandb.run is not None:
                     wandb.log({
-                        "train/loss_total": total_loss,
-                        "train/loss_mse": mse_loss,
-                        "train/loss_lpips": lpips_loss,
-                        "train/psnr": psnr,
-                        "train/step_time": step_t,
-                        "train/total_time": total_t,
+                        "tokenizer/train/loss_total": total_loss,
+                        "tokenizer/train/loss_mse": mse_loss,
+                        "tokenizer/train/loss_lpips": lpips_loss,
+                        "tokenizer/train/psnr": psnr,
+                        "tokenizer/train/step_time": step_t,
+                        "tokenizer/train/total_time": total_t,
                     }, step=step)
 
             # Save (async)
@@ -462,7 +466,7 @@ def run(cfg: TokenizerConfig):
 
                 if cfg.use_wandb and wandb.run is not None:
                     wandb.log({
-                        "viz/reconstruction": wandb.Image(str(img_path)),
+                        "tokenizer/viz/reconstruction": wandb.Image(str(img_path)),
                     }, step=step)
     finally:
         mngr.wait_until_finished()
