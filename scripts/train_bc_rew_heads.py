@@ -1068,7 +1068,7 @@ def run(cfg: RealismConfig):
 if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_bc_rew_flippedrew_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
+        tokenizer_ckpt="/storage/inhokim/dreamer4/test",
         pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
         use_wandb=False,
         wandb_entity="edhu",

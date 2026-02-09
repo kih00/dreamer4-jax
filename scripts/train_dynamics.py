@@ -89,7 +89,7 @@ class RealismConfig:
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
     # train
-    max_steps: int = 1_000_000_000
+    max_steps: int = 10_000_000
     log_every: int = 5_000
     lr: float = 3e-4
 
@@ -866,12 +866,12 @@ def run(cfg: RealismConfig):
 if __name__ == "__main__":
     cfg = RealismConfig(
         run_name="train_dynamics_test",
-        tokenizer_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/pretrained_mae/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
+        tokenizer_ckpt="/storage/inhokim/dreamer4-tinyenv/tokenizer-test/test/checkpoints",
+        use_wandb=True,
+        wandb_entity="inho524890-seoul-national-university",
         wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        max_steps=1_000_000_000,
+        log_dir="/storage/inhokim/dreamer4-tinyenv/dynamics/logs",
+        max_steps=10_000_000,
         log_every=5_000,
         lr=1e-4,
         write_video_every=50_000,

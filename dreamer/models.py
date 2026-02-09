@@ -87,7 +87,7 @@ class MAEReplacer(nn.Module):
         B, T, Np, D = patches_btnd.shape
         mask_token = self.param("mask_token", nn.initializers.normal(0.02), (D,))
         # draw RNGs from a named stream
-        rng = self.make_rng("mae")
+        rng = self.make_rng("mae")  # TODO: see if this is the right way
         p_rng, m_rng = jax.random.split(rng)
         p_bt = jax.random.uniform(p_rng, (B, T), minval=self.p_min, maxval=self.p_max)  # (B,T)
         keep_prob_bt1 = 1.0 - p_bt[..., None]                                           # (B,T,1)
@@ -189,19 +189,19 @@ class SpaceSelfAttentionModality(nn.Module):
     dropout: float = 0.0
 
     def setup(self):
-        # Cache a (S,S) boolean mask indicating allowed key for each query index, per mode.
+        # Cache a (S, S) boolean mask indicating allowed key for each query index, per mode.
         S = int(self.modality_ids.shape[0])
 
         # Broadcast helpers
-        q_idx = jnp.arange(S)[:, None]       # (S,1)
-        k_idx = jnp.arange(S)[None, :]       # (1,S)
+        q_idx = jnp.arange(S)[:, None]        # (S, 1)
+        k_idx = jnp.arange(S)[None, :]        # (1, S)
 
-        is_q_lat = q_idx < self.n_latents     # (S,1) bool
-        is_k_lat = k_idx < self.n_latents     # (1,S) bool
+        is_q_lat = q_idx < self.n_latents     # (S, 1) bool
+        is_k_lat = k_idx < self.n_latents     # (1, S) bool
 
-        q_mod = self.modality_ids[q_idx]      # (S,1)
-        k_mod = self.modality_ids[k_idx]      # (1,S)
-        same_mod = (q_mod == k_mod)           # (S,S)
+        q_mod = self.modality_ids[q_idx]      # (S, 1)
+        k_mod = self.modality_ids[k_idx]      # (1, S)
+        same_mod = (q_mod == k_mod)           # (S, S)
 
         if self.mode == "encoder":
             # latents -> all; non-latents -> same modality only (no access to latents unless same modality==latent, which they aren't)
@@ -517,7 +517,7 @@ class Decoder(nn.Module):
             (B, T, self.n_patches, self.d_model),
         )  # (B, T, Np, D)
 
-        # 3) Concat: [latents, patch queries]  ->  (B, T, S=N_l+N_p, D)
+        # 3) Concat: [latents, patch queries]  ->  (B, T, S, D), S = N_l + Np
         tokens = jnp.concatenate([latents, patches], axis=2)
 
         # 4) Add sinusoidal positions
@@ -529,7 +529,7 @@ class Decoder(nn.Module):
         x = self.transformer(tokens, deterministic=deterministic)
         # 6) Prediction head over the patch-query slice
         x_patches = x[:, :, N_l:, :]                         # (B, T, Np, D)
-        pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B,T,Np,D_patch)
+        pred_btnd = nn.sigmoid(self.patch_head(x_patches))  # (B, T, Np, D_patch)
         return pred_btnd
 
 class ActionEncoder(nn.Module):
@@ -680,13 +680,13 @@ class Dynamics(nn.Module):
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
-        tokens = jnp.concatenate(toks, axis=2)                    # (B,T,S,D)
+        tokens = jnp.concatenate(toks, axis=2)                    # (B, T, S, D)
 
         tokens = add_sinusoidal_positions(tokens)      # (B, T, N_total, d_model)
         x = self.transformer(tokens, deterministic=deterministic)
         spatial_tokens = x[:, :, self.spatial_slice, :]
-        x1_hat = self.flow_x_head(spatial_tokens)
-        h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B,T,n_agent,D) or None
+        x1_hat = self.flow_x_head(spatial_tokens)  # (B, T, n_spatial, d_spatial)
+        h_t = x[:, :, self.agent_slice, :] if self.n_agent > 0 else None  # (B, T, n_agent, D) or None
         return x1_hat, h_t
 
 class TaskEmbedder(nn.Module):
