@@ -1,72 +1,25 @@
 from dataclasses import dataclass, asdict
 from functools import partial
 from typing import Optional
+from time import time
+from pathlib import Path
 import pprint
 import jax
 import jax.numpy as jnp
+from jaxlpips import LPIPS
+import imageio
 import optax
 import wandb
 import pyrallis
 
 from dreamer.models import Encoder, Decoder
 from dreamer.data import make_iterator
-import imageio
-from jaxlpips import LPIPS
-from pathlib import Path
-from time import time
 from dreamer.utils import (
     temporal_patchify, temporal_unpatchify,
     make_state, make_manager, try_restore, maybe_save,
     pack_mae_params, unpack_mae_params
 )
-
-@dataclass(frozen=True)
-class TokenizerConfig:
-    run_name: str = "tokenizer_tinyenv"
-    log_dir: str = "/storage/inhokim/dreamer4-tinyenv/tokenizer"
-    ckpt_max_to_keep: int = 5
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: Optional[str] = None
-    wandb_project: Optional[str] = None
-    wandb_group: Optional[str] = None
-
-    # data
-    B: int = 32
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2  # how many pixels the agent moves per step
-    size_min: int = 6         # minimum size of the square
-    size_max: int = 14        # maximum size of the square
-    hold_min: int = 4         # how long the agent holds a direction for
-    hold_max: int = 9         # how long the agent holds a direction for
-    diversify_data: bool = True
-
-    # tokenizer model config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model: int = 64
-    n_heads: int = 4
-    enc_depth: int = 8
-    dec_depth: int = 8
-    enc_dropout: float = 0.05
-    dec_dropout: float = 0.05
-
-    # train
-    seed: int = 0
-    max_steps: int = 500_000
-    log_every: int = 100
-    viz_every: int = 50_000
-    lr: float = 1e-4
-
-    # losses
-    lpips_weight: float = 0.2
-    lpips_batch_size: int = 8
+from configs.base import TokenizerConfig
 
 
 def init_models(
@@ -241,7 +194,7 @@ def train_step(
 
             lpips = lpips_on_mae_recon(
                 pred, patches_btnd, mae_mask,
-                H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
+                H=cfg.env.H, W=cfg.env.W, C=cfg.env.C, patch=cfg.patch,
                 subsample_frac=lpips_frac,
                 lpips_batch_size=cfg.lpips_batch_size,
                 lpips_loss_fn=lpips_fn,
@@ -296,31 +249,37 @@ def run(cfg: TokenizerConfig):
 
     rng = jax.random.PRNGKey(cfg.seed)
 
-    num_patches = (cfg.H // cfg.patch) * (cfg.W // cfg.patch)
-    D_patch = cfg.patch * cfg.patch * cfg.C
-
-    def unpatchify_outputs(out):
-        return jnp.concatenate(
-            temporal_unpatchify(out, cfg.H, cfg.W, cfg.C, cfg.patch).squeeze(),
-            axis=1,
-        )
-
     # data
-    _next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        cfg.pixels_per_step,
-        cfg.size_min,
-        cfg.size_max,
-        cfg.hold_min,
-        cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+    num_patches = (cfg.env.H // cfg.patch) * (cfg.env.W // cfg.patch)
+    D_patch = cfg.patch * cfg.patch * cfg.env.C
+
+    if cfg.env.env_type == "TinyEnv":
+        _next_batch = make_iterator(
+            cfg.env.B, cfg.env.T, cfg.env.H, cfg.env.W, cfg.env.C,
+            cfg.env.pixels_per_step,
+            cfg.env.size_min,
+            cfg.env.size_max,
+            cfg.env.hold_min,
+            cfg.env.hold_max,
+            fg_min_color=0 if cfg.env.diversify_data else 128,
+            fg_max_color=255 if cfg.env.diversify_data else 128,
+            bg_min_color=0 if cfg.env.diversify_data else 255,
+            bg_max_color=255 if cfg.env.diversify_data else 255,
+        )
+    elif cfg.env.env_type == "Atari":
+        raise NotImplementedError("not implemented yet.")
+
     def next_batch(rng):
         rng, (videos, actions, rewards) = _next_batch(rng)
         return rng, videos
+
+    def unpatchify_outputs(out):
+        return jnp.concatenate(
+            temporal_unpatchify(
+                out, cfg.env.H, cfg.env.W, cfg.env.C, cfg.patch
+            ).squeeze(),
+            axis=1,
+        )
 
     rng, batch_rng = jax.random.split(rng)
     rng, first_batch = next_batch(batch_rng)  # warmup
@@ -346,7 +305,7 @@ def run(cfg: TokenizerConfig):
     first_patches = temporal_patchify(first_batch, cfg.patch)
     rng, enc_vars, dec_vars = init_models(
         rng, encoder, decoder, first_patches,
-        cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck,
+        cfg.env.B, cfg.env.T, cfg.enc_n_latents, cfg.enc_d_bottleneck,
     )
 
     # LPIPS initialization (once)
@@ -373,7 +332,7 @@ def run(cfg: TokenizerConfig):
     state_example = make_state(params, opt_state, rng, step=0)
     meta_example = {
         "enc_kwargs": enc_kwargs, "dec_kwargs": dec_kwargs,
-        "H": cfg.H, "W": cfg.W, "C": cfg.C, "patch": cfg.patch
+        "H": cfg.env.H, "W": cfg.env.W, "C": cfg.env.C, "patch": cfg.patch
     }
 
     restored = try_restore(mngr, state_example, meta_example)
