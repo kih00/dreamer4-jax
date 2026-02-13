@@ -7,7 +7,16 @@ def run_exp():
     )
     job_name = "dreamer4_dynamics_test"
     param_dict = {
-        # "--seed": [0],
+        "--run_name": ["dynamics_tinyenv"],
+        "--tokenizer_ckpt": ["/storage/inhokim/dreamer4-tinyenv/tokenizer/tokenizer_tinyenv/checkpoints"],
+        "--log_dir": ["/storage/inhokim/dreamer4-tinyenv/dynamics"],
+        "--use_wandb": [True],
+        "--wandb_entity": ["inho524890-seoul-national-university"],
+        "--wandb_project": ["tiny_dreamer_4"],
+        "--wandb_group": ["dynamics_test"],
+        "--seed": [0],
+        # "--env.B": [128],
+        # "--lr": [3e-4],
     }
 
     launch_tasks(
@@ -18,7 +27,7 @@ def run_exp():
         exclude=None,
         timeout="7-00:00:00",
         job_name=job_name,
-        max_job_num=1,
+        max_job_num=100,
     )
 
 

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Optional, Union
-from env import *
+from configs.env import *
 
 @dataclass(frozen=True)
 class TokenizerConfig:
@@ -55,18 +55,19 @@ class MTPConfig:
 @dataclass(frozen=True)
 class RealismConfig:
     # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    pretrained_dyn_ckpt: str
-    log_dir: str = "./logs"
+    run_name: str = "dynamics_tinyenv"
+    tokenizer_ckpt: str = "/storage/inhokim/dreamer4-tinyenv/<tokenizer_path>"
+    pretrained_dyn_ckpt: str = "/storage/inhokim/dreamer4-tinyenv/<dynamics_path>"
+    log_dir: str = "./<log_path>"
     ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
+    ckpt_save_every: int = 50_000
 
 
     # wandb config
     use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
+    wandb_entity: Optional[str] = None
+    wandb_project: Optional[str] = None
+    wandb_group: Optional[str] = None
 
     # environment config
     env: EnvConfig = TinyEnvConfig()
@@ -88,12 +89,13 @@ class RealismConfig:
     self_fraction: float = 0.25   # used once we pass bootstrap_start
 
     # train
-    max_steps: int = 1_000_000_000
+    seed: int = 0
+    max_steps: int = 1_000_000
     log_every: int = 5_000
-    lr: float = 3e-4
+    lr: float = 1e-4
 
     # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
+    write_video_every: int = 50_000  # set large to reduce IO, or 0 to disable entirely
 
     # NEW: multi-token prediction (MTP) settings
     mtp_cfg: MTPConfig = MTPConfig()
@@ -115,8 +117,9 @@ class RLConfig:
 
     # wandb config
     use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
+    wandb_entity: Optional[str] = None
+    wandb_project: Optional[str] = None
+    wandb_group: Optional[str] = None
 
     # environment config
     env: EnvConfig = TinyEnvConfig()

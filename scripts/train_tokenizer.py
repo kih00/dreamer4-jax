@@ -1,7 +1,7 @@
 from dataclasses import dataclass, asdict
 from functools import partial
 from typing import Optional
-from time import time
+import time
 from pathlib import Path
 import pprint
 import jax
@@ -237,7 +237,7 @@ def run(cfg: TokenizerConfig):
             config=asdict(cfg),
             project=cfg.wandb_project,
             name=cfg.run_name,
-            group=cfg.wandb_group,
+            group=cfg.wandb_group or cfg.run_name,
             dir=str(Path(cfg.log_dir).resolve()),
         )
         print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
@@ -257,10 +257,8 @@ def run(cfg: TokenizerConfig):
         _next_batch = make_iterator(
             cfg.env.B, cfg.env.T, cfg.env.H, cfg.env.W, cfg.env.C,
             cfg.env.pixels_per_step,
-            cfg.env.size_min,
-            cfg.env.size_max,
-            cfg.env.hold_min,
-            cfg.env.hold_max,
+            cfg.env.size_min, cfg.env.size_max,
+            cfg.env.hold_min, cfg.env.hold_max,
             fg_min_color=0 if cfg.env.diversify_data else 128,
             fg_max_color=255 if cfg.env.diversify_data else 128,
             bg_min_color=0 if cfg.env.diversify_data else 255,
@@ -351,14 +349,14 @@ def run(cfg: TokenizerConfig):
         print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
 
     # ---------- Train loop ----------
-    start_wall = time()
+    start_wall = time.time()
     try:
         for step in range(start_step, cfg.max_steps):
-            data_start_t = time()
+            data_start_t = time.time()
             rng, batch = next_batch(rng)
-            data_t = time() - data_start_t
+            data_t = time.time() - data_start_t
 
-            train_start_t = time()
+            train_start_t = time.time()
             rng, master_key = jax.random.split(rng)
             params, opt_state, enc_vars, dec_vars, aux = train_step(
                 cfg,
@@ -366,7 +364,7 @@ def run(cfg: TokenizerConfig):
                 enc_vars, dec_vars, batch,
                 master_key=master_key, step=step,
             )
-            train_t = time() - train_start_t
+            train_t = time.time() - train_start_t
 
             # Log
             if step % cfg.log_every == 0:
@@ -375,7 +373,7 @@ def run(cfg: TokenizerConfig):
                 total_loss = float(aux['loss_total'])
                 psnr = float(10 * jnp.log10(1.0 / jnp.maximum(mse_loss, 1e-10)))
                 step_t = data_t + train_t
-                total_t = time() - start_wall
+                total_t = time.time() - start_wall
 
                 pieces = [
                     f"[train] step={step:06d}",
