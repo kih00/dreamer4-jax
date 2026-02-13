@@ -223,7 +223,7 @@ def train_step_efficient(
     sigma_idx_self = sigma_idx_full[B_emp:]  # (B_self, T)
 
     # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
-    z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
+    z0_full = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
     z_tilde_full = (
         (1.0 - sigma_full)[..., None, None] * z0_full
         + sigma_full[..., None, None] * z1
@@ -297,7 +297,7 @@ def train_step_efficient(
             boot_per = (
                 (1.0 - sigma_self) ** 2
                 * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))
-                )  # (B_self,T)
+            )  # (B_self, T)
             loss_self = jnp.mean(boot_per * w_self)
             return loss_self, jnp.mean(boot_per)
 
@@ -530,6 +530,7 @@ class TrainState:
 
 def initialize_models_and_tokenizer(
     cfg: RealismConfig,
+    rng: jnp.ndarray,
     frames_init: jnp.ndarray,
     actions_init: jnp.ndarray,
 ) -> TrainState:
@@ -582,7 +583,6 @@ def initialize_models_and_tokenizer(
     dynamics = Dynamics(**dyn_kwargs)
 
     patches_btnd = temporal_patchify(frames_init, patch)
-    rng = jax.random.PRNGKey(0)
     enc_vars = encoder.init(
         {"params": rng, "mae": rng, "dropout": rng},
         patches_btnd,
@@ -604,13 +604,19 @@ def initialize_models_and_tokenizer(
     )
 
     # Build initial z1 to shape dynamics init
-    mae_eval_key = jax.random.PRNGKey(777)
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
+    rng, mae_eval_key = jax.random.split(rng)
+    z_btLd, _ = encoder.apply(
+        enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True
+    )
+    z1 = pack_bottleneck_to_spatial(
+        z_btLd, n_spatial=n_spatial, k=cfg.packing_factor
+    )
     emax = jnp.log2(cfg.k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.env.B, cfg.env.T), emax, dtype=jnp.int32)
     sigma_idx = jnp.full((cfg.env.B, cfg.env.T), cfg.k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
+    dyn_vars = dynamics.init(
+        {"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1
+    )
     params = dyn_vars["params"]
 
     tx = optax.adam(cfg.lr)
@@ -768,10 +774,12 @@ def run(cfg: RealismConfig):
         raise NotImplementedError("not implemented yet")
 
     # Initialize models and restore tokenizer
-    rng, init_rng = jax.random.split(rng)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
+    rng, (frames_init, actions_init, _) = next_batch(rng)
 
-    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+    rng, init_rng = jax.random.split(rng)
+    train_state = initialize_models_and_tokenizer(
+        cfg, init_rng, frames_init, actions_init
+    )
 
     # Extract some values for checkpointing
     patch = cfg.tokenizer.patch
@@ -794,8 +802,9 @@ def run(cfg: RealismConfig):
         cfg=asdict(cfg),
     )
 
+    rng, state_rng = jax.random.split(rng)
     state_example = make_state(
-        train_state.params, train_state.opt_state, rng, step=0
+        train_state.params, train_state.opt_state, state_rng, step=0
     )
     restored = try_restore(mngr, state_example, meta)
 
@@ -812,7 +821,6 @@ def run(cfg: RealismConfig):
         print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
 
     # -------- Training loop --------
-
     start_wall = time.time()
     for step in range(start_step, cfg.max_steps + 1):
         # Data

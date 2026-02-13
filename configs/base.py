@@ -72,8 +72,10 @@ class RealismConfig:
     # environment config
     env: EnvConfig = TinyEnvConfig()
 
-    # tokenizer / dynamics config
+    # tokenizer config
     tokenizer: TokenizerConfig = TokenizerConfig()
+
+    # dynamics config
     d_model: int = 128
     depth: int = 8
     packing_factor: int = 2
@@ -98,12 +100,12 @@ class RealismConfig:
     write_video_every: int = 50_000  # set large to reduce IO, or 0 to disable entirely
 
     # NEW: multi-token prediction (MTP) settings
-    mtp_cfg: MTPConfig = MTPConfig()
+    mtp: MTPConfig = MTPConfig()
 
     # Loss weighting (to balance scales across different loss components)
     loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
+    loss_weight_policy: float = 0.3      # weight for policy CE loss (nats)
+    loss_weight_reward: float = 0.3      # weight for reward CE loss (nats)
 
 
 @dataclass(frozen=True)
@@ -141,7 +143,7 @@ class RLConfig:
     visualize_every: int = 25_000
 
     # RL-specific
-    mtp_cfg: MTPConfig = MTPConfig()
+    mtp: MTPConfig = MTPConfig()
 
     # RL hyperparameters
     gamma: float = 0.997

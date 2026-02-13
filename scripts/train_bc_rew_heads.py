@@ -1,7 +1,6 @@
 # train_bc_rew_heads.py
 # given the pretrained world model, train the agent tokens with bc and rew prediction.
 # while still applying the diffusion / shortcut loss.
-from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
@@ -9,10 +8,12 @@ from functools import partial
 import json
 import time
 import math
+import pprint
 from einops import reduce
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array
 import numpy as np
 import optax
 import imageio.v2 as imageio
@@ -23,9 +24,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
+import pyrallis
 
 # UPDATED: bring in heads + task embedder
-from dreamer.models import Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
+from dreamer.models import (
+    Encoder, Decoder, Dynamics, TaskEmbedder, PolicyHeadMTP, RewardHeadMTP
+)
 from dreamer.data import make_iterator
 from dreamer.utils import (
     temporal_patchify,
@@ -36,83 +40,7 @@ from dreamer.utils import (
 )
 
 from dreamer.sampler import SamplerConfig, sample_video
-
-# ---------------------------
-# Config
-# ---------------------------
-
-@dataclass(frozen=True)
-class RealismConfig:
-    # IO / ckpt
-    run_name: str
-    tokenizer_ckpt: str
-    pretrained_dyn_ckpt: str
-    log_dir: str = "./logs"
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
-
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None  # if None, uses default entity
-    wandb_project: str | None = None  # if None, uses run_name as project
-
-    # data
-    B: int = 64
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
-    action_dim: int = 4 # number of categorical actions
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    packing_factor: int = 2
-    n_register: int = 4 # number of register tokens for dynamics
-    n_agent: int = 1 # number of agent tokens for dynamics
-
-    # UPDATED: default to wm_agent (fine-tuning with agent readouts)
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-    bootstrap_start: int = 5_000  # warm-up steps with bootstrap masked out
-    self_fraction: float = 0.25   # used once we pass bootstrap_start
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000  # set large to reduce IO, or 0 to disable entirely
-
-    # NEW: multi-token prediction (MTP) settings
-    L: int = 2                      # predict next L actions/rewards
-    num_reward_bins: int = 101      # twohot bins for symexp rewards
-    reward_log_low: float = -3.0    # log-space lower bound for reward bins (tune per dataset)
-    reward_log_high: float = 3.0   # log-space upper bound for reward bins (tune per dataset)
-    n_tasks: int = 128              # task-ID space for TaskEmbedder
-    use_task_ids: bool = True       # True: discrete task IDs; False: vector embed
-    
-    # Loss weighting (to balance scales across different loss components)
-    loss_weight_shortcut: float = 1.0    # weight for flow/bootstrap loss (MSE units)
-    loss_weight_policy: float = 1.0      # weight for policy CE loss (nats)
-    loss_weight_reward: float = 1.0      # weight for reward CE loss (nats)
+from configs.base import RealismConfig
 
 # ---------------------------
 # Small helpers
@@ -128,7 +56,12 @@ def _to_uint8(img_f32):
 def _stack_wide(*imgs_hwC):
     return np.concatenate(imgs_hwC, axis=1)
 
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
+def _tile_videos(
+    trip_list_hwC: list[Array],  # list of (H, W*3, C) np arrays
+    *,
+    ncols: int = 2,
+    pad_color: int = 0
+) -> Array:
     if len(trip_list_hwC) == 0:
         raise ValueError("Empty video list")
     H, W3, C = trip_list_hwC[0].shape
@@ -154,7 +87,7 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
 def load_pretrained_tokenizer(
     tokenizer_ckpt_dir: str,
     *,
-    rng: jnp.ndarray,
+    rng: Array,
     encoder: Encoder,
     decoder: Decoder,
     enc_vars,
@@ -164,8 +97,12 @@ def load_pretrained_tokenizer(
     meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
     latest = meta_mngr.latest_step()
     if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
-    restored_meta = meta_mngr.restore(latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore()))
+        raise FileNotFoundError(
+            f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}"
+        )
+    restored_meta = meta_mngr.restore(
+        latest, args=ocp.args.Composite(meta=ocp.args.JsonRestore())
+    )
     meta = restored_meta.meta
     enc_kwargs = meta["enc_kwargs"]
     n_lat, d_b = enc_kwargs["n_latents"], enc_kwargs["d_bottleneck"]
@@ -173,13 +110,17 @@ def load_pretrained_tokenizer(
     rng_e1, rng_d1 = jax.random.split(rng)
     B, T = sample_patches_btnd.shape[:2]
     fake_z = jnp.zeros((B, T, n_lat, d_b), dtype=jnp.float32)
-    dec_vars = decoder.init({"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True)
+    dec_vars = decoder.init(
+        {"params": rng_d1, "dropout": rng_d1}, fake_z, deterministic=True
+    )
 
     packed_example = pack_mae_params(enc_vars, dec_vars)
     tx_dummy = optax.adamw(1e-4)
     opt_state_example = tx_dummy.init(packed_example)
     state_example = make_state(packed_example, opt_state_example, rng_e1, step=0)
-    abstract_state = jax.tree_util.tree_map(ocp.utils.to_shape_dtype_struct, state_example)
+    abstract_state = jax.tree_util.tree_map(
+        ocp.utils.to_shape_dtype_struct, state_example
+    )
 
     tok_mngr = make_manager(tokenizer_ckpt_dir, item_names=("state", "meta"))
     restored = tok_mngr.restore(
@@ -194,7 +135,10 @@ def load_pretrained_tokenizer(
     dec_params = packed_params["dec"]
     new_enc_vars = with_params(enc_vars, enc_params)
     new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
+    print(
+        f"[tokenizer] Restored encoder/decoder "
+        f"from {tokenizer_ckpt_dir} (step {latest})"
+    )
     return new_enc_vars, new_dec_vars, meta
 
 # ---------------------------
@@ -237,12 +181,12 @@ def _gather_future_actions(labels_bt, L):
     (following Dreamer convention: action a_i happens before state s_i)
     """
     B, T = labels_bt.shape
-    labels_pad = jnp.pad(labels_bt, ((0,0),(0,L)), constant_values=-1)
+    labels_pad = jnp.pad(labels_bt, ((0, 0), (0, L)), constant_values=-1)
     
     # Vectorized version: use advanced indexing instead of list comprehension
     # Create indices for all L offsets at once
     # Offsets start at 1 because we predict the NEXT L actions (t+1, t+2, ..., t+L)
-    offsets = jnp.arange(1, L+1)  # (L,) = [1, 2, ..., L]
+    offsets = jnp.arange(1, L + 1)  # (L,) = [1, 2, ..., L]
     indices = jnp.arange(T)[:, None] + offsets[None, :]  # (T, L)
     labels_btL = labels_pad[:, indices]  # (B, T, L) - JAX broadcasts batch dim
     valid_btL = (labels_btL >= 0)
@@ -280,24 +224,24 @@ def _gather_future_rewards(values_bt, L):
 
 @partial(
     jax.jit,
-    static_argnames=("encoder","dynamics","task_embedder","policy_head","reward_head",
-                     "tx","patch","n_spatial","k_max","packing_factor","B","T","B_self","L",
-                     "loss_weight_shortcut","loss_weight_policy","loss_weight_reward"),
+    static_argnames=(
+        "cfg",
+        "encoder", "dynamics",
+        "task_embedder", "policy_head", "reward_head",
+        "tx",
+        "B_self", "n_spatial",
+    ),
 )
 def train_step_efficient(
+    cfg: RealismConfig,
     encoder, dynamics, task_embedder, policy_head, reward_head, tx,
     params, opt_state,
     enc_vars, dyn_vars, task_vars, pi_vars, rew_vars,
     frames, actions, rewards,
     *,
-    patch: int,
-    B: int, T: int, B_self: int,            # assume 0 <= B_self < B
-    n_spatial: int, k_max: int, packing_factor: int,
-    L: int,
-    master_key: jnp.ndarray, step: int, bootstrap_start: int,
-    loss_weight_shortcut: float,
-    loss_weight_policy: float,
-    loss_weight_reward: float,
+    B_self: int,            # assume 0 <= B_self < B
+    n_spatial: int,
+    master_key: Array, step: int,
 ):
     """
     Deterministic two-branch training (one fused main forward):
@@ -305,8 +249,10 @@ def train_step_efficient(
       - last  B_self rows: bootstrap self-consistency with d > d_min
     Adds multi-token policy/reward losses from agent readouts h_t.
     """
-    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
-    def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
+    @partial(jax.jit, static_argnames=("shape_bt", "k_max",))
+    def _sample_tau_for_step(
+        rng, shape_bt, k_max: int, step_idx: Array, *, dtype=jnp.float32
+    ):
         B_, T_ = shape_bt
         K = (1 << step_idx)
         u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
@@ -315,8 +261,8 @@ def train_step_efficient(
         tau_idx = j_idx * (k_max // K)
         return tau, tau_idx
 
-    @partial(jax.jit, static_argnames=("shape_bt","k_max",))
-    def _sample_step_excluding_dmin(rng, shape_bt, k_max:int):
+    @partial(jax.jit, static_argnames=("shape_bt", "k_max",))
+    def _sample_step_excluding_dmin(rng, shape_bt, k_max: int):
         B_, T_ = shape_bt
         emax = jnp.log2(k_max).astype(jnp.int32)
         step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)  # exclude emax
@@ -324,37 +270,57 @@ def train_step_efficient(
         return d, step_idx
 
     # ---------- Param-free precompute ----------
-    patches_btnd = temporal_patchify(frames, patch)
+    patches_btnd = temporal_patchify(frames, cfg.tokenizer.patch)
+    B, T = cfg.env.B, cfg.env.T
 
     # RNGs
     step_key = jax.random.fold_in(master_key, step)
-    (enc_key, key_sigma_full, key_step_self, key_noise_full,
-     drop_key, drop_pi, drop_rw, task_key) = jax.random.split(step_key, 8)
+    (
+        enc_key,
+        key_sigma_full,
+        key_step_self,
+        key_noise_full,
+        drop_key,
+        drop_pi,
+        drop_rw,
+        task_key
+    ) = jax.random.split(step_key, 8)
 
     # Frozen encoder → spatial tokens (clean target z1)
-    z_bottleneck, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_bottleneck, n_spatial=n_spatial, k=packing_factor)  # (B,T,Sz,Dz)
+    z_bottleneck, _ = encoder.apply(
+        enc_vars, patches_btnd, rngs={"mae": enc_key}, deterministic=True
+    )  # z_bottleneck: (B, T, N_b, D_b)
+    z1 = pack_bottleneck_to_spatial(
+        z_bottleneck, n_spatial=n_spatial, k=cfg.packing_factor
+    )  # z1: (B, T, Sz, Dz)
 
     # Deterministic batch split
     B_emp  = B - B_self
     actions_full = actions
-    emax = jnp.log2(k_max).astype(jnp.int32)
+    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
 
     # --- Step indices (encode d) ---
-    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min
-    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max)
-    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
+    step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)  # d = d_min
+    d_self, step_idx_self = _sample_step_excluding_dmin(
+        key_step_self, (B_self, T), cfg.k_max
+    )
+    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)  # (B, T)
 
     # --- Signal levels on each row's grid (one call for whole batch) ---
-    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), k_max, step_idx_full)
-    sigma_emp   = sigma_full[:B_emp]
-    sigma_self  = sigma_full[B_emp:]
-    sigma_idx_self = sigma_idx_full[B_emp:]
+    sigma_full, sigma_idx_full = _sample_tau_for_step(
+        key_sigma_full, (B, T), cfg.k_max, step_idx_full
+    )
+    sigma_emp  = sigma_full[:B_emp]  # (B_emp, T)
+    sigma_self = sigma_full[B_emp:]  # (B_self, T)
+    sigma_idx_self = sigma_idx_full[B_emp:]  # (B_self, T)
 
     # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
-    z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
-    z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * z1
-    z_tilde_self = z_tilde_full[B_emp:]
+    z0_full = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
+    z_tilde_full = (
+        (1.0 - sigma_full)[..., None, None] * z0_full
+        + sigma_full[..., None, None] * z1
+    )  # (B, T, Sz, Dz)
+    z_tilde_self = z_tilde_full[B_emp:]  # (B_self, T, Sz, Dz)
 
     # --- Ramp weights ---
     w_emp  = 0.9 * sigma_emp  + 0.1
@@ -364,7 +330,7 @@ def train_step_efficient(
     d_half            = d_self / 2.0
     step_idx_half     = step_idx_self + 1
     sigma_plus        = sigma_self + d_half
-    sigma_idx_plus    = sigma_idx_self + (k_max * d_half).astype(jnp.int32)
+    sigma_idx_plus    = sigma_idx_self + (cfg.k_max * d_half).astype(jnp.int32)
 
     # --- Agent tokens from (dummy) task IDs (B,) -> (B,T,n_agent,D) ---
     dummy_task_ids = jnp.zeros((B,), dtype=jnp.int32)
@@ -382,86 +348,125 @@ def train_step_efficient(
         # Main forward (emp + self) → z1_hat and agent readouts h
         z1_hat_full, h_btnd = dynamics.apply(
             local_dyn, actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
-            agent_tokens=agent_tokens, rngs={"dropout": drop_key}, deterministic=False,
-        )  # z1_hat_full: (B,T,Sz,Dz), h: (B,T,n_agent,D)
+            agent_tokens=agent_tokens,
+            rngs={"dropout": drop_key},
+            deterministic=False,
+        )  # z1_hat_full: (B, T, Sz, Dz), h: (B, T, n_agent, D)
 
-        # Pool agents (mean) → (B,T,D)
+        # Pool agents (mean) → (B, T, D)
         h_pooled_btd = reduce(h_btnd, "b t n_agent d -> b t d", "mean")
         # ---------- Flow loss on empirical rows (to z1) ----------
         z1_hat_emp  = z1_hat_full[:B_emp]
         z1_hat_self = z1_hat_full[B_emp:]
 
-        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))        # (B_emp,T)
+        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp]) ** 2, axis=(2, 3))  # (B_emp, T)
         loss_emp = jnp.mean(flow_per * w_emp)
 
         # ---------- Self-consistency (bootstrap) on self rows ----------
-        do_boot = (B_self > 0) & (step >= bootstrap_start)
+        do_boot = (B_self > 0) & (step >= cfg.bootstrap_start)
 
         def _boot_loss():
             z1_hat_half1, _ = dynamics.apply(
-                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
-                agent_tokens=agent_tokens[B_emp:], rngs={"dropout": drop_key}, deterministic=False,
+                local_dyn,
+                actions_full[B_emp:],
+                step_idx_half,
+                sigma_idx_self,
+                z_tilde_self,
+                agent_tokens=agent_tokens[B_emp:],
+                rngs={"dropout": drop_key},
+                deterministic=False,
+            )  # z1_hat_half1: (B_self, T, Sz, Dz)
+            b_prime = (
+                (z1_hat_half1 - z_tilde_self)
+                / (1.0 - sigma_self)[..., None, None]
             )
-            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
-            z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+            z_prime = z_tilde_self + b_prime * d_half[..., None, None]
             z1_hat_half2, _ = dynamics.apply(
-                local_dyn, actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
-                agent_tokens=agent_tokens[B_emp:], rngs={"dropout": drop_key}, deterministic=False,
+                local_dyn,
+                actions_full[B_emp:],
+                step_idx_half,
+                sigma_idx_plus,
+                z_prime,
+                agent_tokens=agent_tokens[B_emp:],
+                rngs={"dropout": drop_key},
+                deterministic=False,
+            )  # z1_hat_half2: (B_self, T, Sz, Dz)
+            b_doubleprime = (
+                (z1_hat_half2 - z_prime)
+                / (1.0 - sigma_plus)[..., None, None]
             )
-            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
-            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            vhat_sigma = (
+                (z1_hat_self - z_tilde_self)
+                / (1.0 - sigma_self)[..., None, None]
+            )
             vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-            boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+            boot_per = (
+                (1.0 - sigma_self) ** 2
+                * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))
+            )  # (B_self, T)
             loss_self = jnp.mean(boot_per * w_self)
             return loss_self, jnp.mean(boot_per)
 
         loss_self, boot_mse = jax.lax.cond(
             do_boot,
             _boot_loss,
-            lambda: (jnp.array(0.0, dtype=z1.dtype), jnp.array(0.0, dtype=z1.dtype)),
+            lambda: (
+                jnp.array(0.0, dtype=z1.dtype), jnp.array(0.0, dtype=z1.dtype)
+            ),
         )
 
         # ---------- MTP: Policy (categorical CE over next L actions) ----------
-        # logits: (B,T,L,A)
-        pi_logits = policy_head.apply(local_pi, h_pooled_btd, rngs={"dropout": drop_pi}, deterministic=False)
+        pi_logits = policy_head.apply(
+            local_pi,
+            h_pooled_btd,
+            rngs={"dropout": drop_pi},
+            deterministic=False,
+        )  # logits: (B, T, L, A)
 
-        labels_btL, valid_btL = _gather_future_actions(actions_full, L)  # (B,T,L), (B,T,L)
-        logp = jax.nn.log_softmax(pi_logits, axis=-1)                # (B,T,L,A)
+        labels_btL, valid_btL = _gather_future_actions(actions_full, cfg.mtp.L)
+        logp = jax.nn.log_softmax(pi_logits, axis=-1)  # (B, T, L, A)
         A = logp.shape[-1]
-        safe_labels = jnp.where(valid_btL, labels_btL, 0)
-        tgt = jax.nn.one_hot(safe_labels, A) * valid_btL[..., None]  # (B,T,L,A)
-        nll = -jnp.sum(tgt * logp, axis=-1)                          # (B,T,L)
-        denom = jnp.maximum(valid_btL.sum(), 1)
-        pi_ce = jnp.sum(nll) / denom
+        safe_labels = jnp.where(valid_btL, labels_btL, 0)  # (B, T, L)
+        tgt = jax.nn.one_hot(safe_labels, A) * valid_btL[..., None]  # (B, T, L, A)
+        nll = -jnp.sum(tgt * logp, axis=-1)  # (B, T, L)
+        pi_ce = jnp.sum(nll) / jnp.maximum(valid_btL.sum(), 1)
 
-        # ---------- MTP: Reward (symexp twohot CE over current and future L rewards) ----------
+        # ---- MTP: Reward (symexp twohot CE over current and future L rewards) ----
         # rewards: (B, T) where rewards[:, 0] = r0 (dummy, invalid)
         #          and rewards[:, 1] = r1, rewards[:, 2] = r2, ... are valid
-        # At timestep t >= 1, we predict rewards[t], rewards[t+1], ..., rewards[t+L-1]
+        # At timestep t >= 1, we predict rewards[t], ..., rewards[t+L-1] (L rewards)
         # The first offset (n=0) predicts r_t from h_t, which contains a_t
         # We skip t=0 entirely since h_0 has no valid reward to predict
-        rew_btL, valid_rew_btL = _gather_future_rewards(rewards, L)  # (B,T,L), (B,T,L)
+        rew_btL, valid_rew_btL = _gather_future_rewards(rewards, cfg.mtp.L)
 
         # Get bin centers (constants collection) and logits in one forward pass
-        rew_logits, centers_log = reward_head.apply(local_rw, h_pooled_btd, rngs={"dropout": drop_rw}, deterministic=False)
-        twohot = _twohot_symlog_targets(rew_btL, centers_log)               # (B,T,L,K)
-        logq = jax.nn.log_softmax(rew_logits, axis=-1)                      # (B,T,L,K)
-        ce_rew = -jnp.sum(twohot * logq, axis=-1)                           # (B,T,L)
-        rw_ce = jnp.sum(ce_rew * valid_rew_btL) / jnp.maximum(valid_rew_btL.sum(), 1)
+        rew_logits, centers_log = reward_head.apply(
+            local_rw,
+            h_pooled_btd,
+            rngs={"dropout": drop_rw},
+            deterministic=False,
+        )  # logits: (B, T, L, K), centers: (K,)
+        twohot = _twohot_symlog_targets(rew_btL, centers_log)  # (B, T, L, K)
+        logq = jax.nn.log_softmax(rew_logits, axis=-1)  # (B, T, L, K)
+        ce_rew = -jnp.sum(twohot * logq, axis=-1)  # (B, T, L)
+        rw_ce = (
+            jnp.sum(ce_rew * valid_rew_btL)
+            / jnp.maximum(valid_rew_btL.sum(), 1)
+        )
         # ---------- Combine ----------
         shortcut_loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
-        loss = (loss_weight_shortcut * shortcut_loss + 
-                loss_weight_policy * pi_ce + 
-                loss_weight_reward * rw_ce)
+        loss = (cfg.loss_weight_shortcut * shortcut_loss + 
+                cfg.loss_weight_policy * pi_ce + 
+                cfg.loss_weight_reward * rw_ce)
 
         aux = {
             "flow_mse": jnp.mean(flow_per),
             "bootstrap_mse": boot_mse,
             "pi_ce": pi_ce,
             "rw_ce": rw_ce,
-            "w_shortcut": loss_weight_shortcut * shortcut_loss,
-            "w_pi_ce": loss_weight_policy * pi_ce,
-            "w_rw_ce": loss_weight_reward * rw_ce,
+            "w_shortcut": cfg.loss_weight_shortcut * shortcut_loss,
+            "w_pi_ce": cfg.loss_weight_policy * pi_ce,
+            "w_rw_ce": cfg.loss_weight_reward * rw_ce,
         }
         return loss, aux
 
@@ -474,14 +479,14 @@ def train_step_efficient(
 # Eval regimes & plan JSON (unchanged core logic)
 # ---------------------------
 
-def _eval_regimes_for_realism(cfg, *, ctx_length: int):
+def _eval_regimes_for_realism(cfg: RealismConfig, *, ctx_length: int):
     common = dict(
         k_max=cfg.k_max,
-        horizon=min(32, cfg.T - ctx_length),
+        horizon=min(32, cfg.env.T - ctx_length),
         ctx_length=ctx_length,
         ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
-        n_spatial=cfg.enc_n_latents // cfg.packing_factor,
+        H=cfg.env.H, W=cfg.env.W, C=cfg.env.C, patch=cfg.tokenizer.patch,
+        n_spatial=cfg.tokenizer.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,
         start_mode="pure",
         rollout="autoregressive",
@@ -531,11 +536,11 @@ def _plan_from_sampler_conf(s: SamplerConfig) -> Dict[str, Any]:
 # ---------------------------
 
 def build_tiled_video_frames(
-    gt_frames: jnp.ndarray,
-    floor_frames: jnp.ndarray,
-    pred_frames: jnp.ndarray,
+    gt_frames: Array,
+    floor_frames: Array,
+    pred_frames: Array,
     batch_size: int,
-) -> list[np.ndarray]:
+) -> list[Array]:  # list of np arrays
     """
     Build tiled video frames from ground truth, floor, and prediction frames.
 
@@ -561,7 +566,11 @@ def build_tiled_video_frames(
 
     for t_idx in range(T_total):
         trip_list = [
-            _stack_wide(gt_np_all[b, t_idx], floor_np_all[b, t_idx], pred_np_all[b, t_idx])
+            _stack_wide(
+                gt_np_all[b, t_idx],
+                floor_np_all[b, t_idx],
+                pred_np_all[b, t_idx]
+            )
             for b in range(batch_size)
         ]
         grid_img = _tile_videos(trip_list, ncols=ncols, pad_color=0)
@@ -570,7 +579,7 @@ def build_tiled_video_frames(
     return grid_frames
 
 def save_evaluation_video(
-    grid_frames: list[np.ndarray],
+    grid_frames: list[Array],  # np arrays
     output_path: Path,
     tag: str,
 ) -> bool:
@@ -586,7 +595,9 @@ def save_evaluation_video(
         True if successful, False otherwise
     """
     try:
-        with imageio.get_writer(output_path, fps=25, codec="libx264", quality=8) as w:
+        with imageio.get_writer(
+            output_path, fps=25, codec="libx264", quality=8
+        ) as w:
             for fr in grid_frames:
                 w.append_data(fr)
         return True
@@ -676,9 +687,9 @@ class TrainState:
     enc_kwargs: dict
     dec_kwargs: dict
     dyn_kwargs: dict
-    tx: optax.Transform
+    tx: optax.transforms
     opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
+    mae_eval_key: Array
 
 # ---------------------------
 # Model initialization
@@ -687,7 +698,12 @@ def load_pretrained_dynamics_params(ckpt_dir: str, dyn_vars: dict) -> dict:
     tx_dummy = optax.adam(1e-3)
     opt_state_example = tx_dummy.init(dyn_vars["params"])
     rng = jax.random.PRNGKey(0)
-    state_example = {"params": dyn_vars["params"], "opt_state": opt_state_example, "rng": rng, "step": jnp.int32(0)}
+    state_example = {
+        "params": dyn_vars["params"],
+        "opt_state": opt_state_example,
+        "rng": rng,
+        "step": jnp.int32(0)
+    }
     mngr = make_manager(ckpt_dir, item_names=("state","meta"))
     restored = try_restore(mngr, state_example, meta_example={})
     if restored is None:
@@ -698,48 +714,49 @@ def load_pretrained_dynamics_params(ckpt_dir: str, dyn_vars: dict) -> dict:
 
 def initialize_models_and_tokenizer(
     cfg: RealismConfig,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
+    rng: Array,
+    frames_init: Array,
+    actions_init: Array,
 ) -> TrainState:
     """
     Initialize encoder, decoder, dynamics models and restore tokenizer.
     Also initialize TaskEmbedder, PolicyHeadMTP, RewardHeadMTP and pack params.
     """
-    patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
-    k_max = cfg.k_max
+    patch = cfg.tokenizer.patch
+    num_patches = (cfg.env.H // patch) * (cfg.env.W // patch)
+    D_patch = patch * patch * cfg.env.C
 
+    tok_cfg = cfg.tokenizer
     enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
+        d_model=tok_cfg.d_model,
+        n_latents=tok_cfg.enc_n_latents,
         n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        depth=cfg.enc_depth,
+        n_heads=tok_cfg.n_heads,
+        depth=tok_cfg.enc_depth,
         dropout=0.0,
-        d_bottleneck=cfg.enc_d_bottleneck,
+        d_bottleneck=tok_cfg.enc_d_bottleneck,
         mae_p_min=0.0, mae_p_max=0.0,
         time_every=4, latents_only_time=True,
     )
     dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
+        d_model=tok_cfg.d_model,
+        n_heads=tok_cfg.n_heads,
+        depth=tok_cfg.dec_depth,
+        n_latents=tok_cfg.enc_n_latents,
         n_patches=num_patches,
         d_patch=D_patch,
         dropout=0.0,
         mlp_ratio=4.0, time_every=4, latents_only_time=True,
     )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
+    n_spatial = tok_cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
         d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
+        d_bottleneck=tok_cfg.enc_d_bottleneck,
+        d_spatial=tok_cfg.enc_d_bottleneck * cfg.packing_factor,
         n_spatial=n_spatial, n_register=cfg.n_register,
-        n_heads=cfg.n_heads, depth=cfg.dyn_depth,
+        n_heads=tok_cfg.n_heads, depth=cfg.depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=k_max, 
+        dropout=0.0, k_max=cfg.k_max, 
         time_every=4,
     )
 
@@ -748,10 +765,21 @@ def initialize_models_and_tokenizer(
     dynamics = Dynamics(**dyn_kwargs)
 
     patches_btnd = temporal_patchify(frames_init, patch)
-    rng = jax.random.PRNGKey(0)
-    enc_vars = encoder.init({"params": rng, "mae": rng, "dropout": rng}, patches_btnd, deterministic=True)
-    fake_z = jnp.zeros((cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck))
-    dec_vars = decoder.init({"params": rng, "dropout": rng}, fake_z, deterministic=True)
+    rng, enc_rng = jax.random.split(rng)
+    enc_vars = encoder.init(
+        {"params": enc_rng, "mae": enc_rng, "dropout": enc_rng},
+        patches_btnd,
+        deterministic=True,
+    )
+    fake_z = jnp.zeros(
+        (cfg.env.B, cfg.env.T, tok_cfg.enc_n_latents, tok_cfg.enc_d_bottleneck)
+    )
+    rng, dec_rng = jax.random.split(rng)
+    dec_vars = decoder.init(
+        {"params": dec_rng, "dropout": dec_rng},
+        fake_z,
+        deterministic=True
+    )
 
     # Restore tokenizer
     enc_vars, dec_vars, _ = load_pretrained_tokenizer(
@@ -762,31 +790,58 @@ def initialize_models_and_tokenizer(
     )
 
     # Build initial z1 to shape dynamics init
-    mae_eval_key = jax.random.PRNGKey(777)
-    z_btLd, _ = encoder.apply(enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True)
-    z1 = pack_bottleneck_to_spatial(z_btLd, n_spatial=n_spatial, k=cfg.packing_factor)
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
-    dyn_vars = dynamics.init({"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1)
+    rng, mae_eval_key = jax.random.split(rng)
+    z_btLd, _ = encoder.apply(
+        enc_vars, patches_btnd, rngs={"mae": mae_eval_key}, deterministic=True
+    )
+    z1 = pack_bottleneck_to_spatial(
+        z_btLd, n_spatial=n_spatial, k=cfg.packing_factor
+    )
+    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
+    step_idx = jnp.full((cfg.env.B, cfg.env.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), cfg.k_max - 1, dtype=jnp.int32)
+    rng, dyn_rng = jax.random.split(rng)
+    dyn_vars = dynamics.init(
+        {"params": dyn_rng, "dropout": dyn_rng},
+        actions_init, step_idx, sigma_idx, z1,
+    )
     print(f"[dynamics] Loading pretrained params from {cfg.pretrained_dyn_ckpt}")
     dyn_pre = load_pretrained_dynamics_params(cfg.pretrained_dyn_ckpt, dyn_vars)
     dyn_vars = with_params(dyn_vars, dyn_pre)
 
     # NEW: heads & task embedder
-    task_embedder = TaskEmbedder(d_model=cfg.d_model_dyn, n_agent=cfg.n_agent,
-                                 use_ids=cfg.use_task_ids, n_tasks=cfg.n_tasks)
-    policy_head  = PolicyHeadMTP(d_model=cfg.d_model_dyn, action_dim=cfg.action_dim, L=cfg.L)
-    reward_head  = RewardHeadMTP(d_model=cfg.d_model_dyn, L=cfg.L, num_bins=cfg.num_reward_bins,
-                                 log_low=cfg.reward_log_low, log_high=cfg.reward_log_high)
+    task_embedder = TaskEmbedder(
+        d_model=cfg.d_model,
+        n_agent=cfg.n_agent,
+        use_ids=cfg.mtp.use_task_ids,
+        n_tasks=cfg.mtp.n_tasks,
+    )
+    policy_head  = PolicyHeadMTP(
+        d_model=cfg.d_model,
+        action_dim=cfg.env.action_dim,
+        L=cfg.mtp.L,
+    )
+    reward_head  = RewardHeadMTP(
+        d_model=cfg.d_model,
+        L=cfg.mtp.L,
+        num_bins=cfg.mtp.num_reward_bins,
+        log_low=cfg.mtp.reward_log_low,
+        log_high=cfg.mtp.reward_log_high,
+    )
 
-    rng_task, rng_pi, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
-    task_vars = task_embedder.init({"params": rng_task}, dummy_task_ids, cfg.B, cfg.T)
+    task_rng, pi_rng, rw_rng = jax.random.split(rng, 3)
+    dummy_task_ids = jnp.zeros((cfg.env.B,), dtype=jnp.int32)
+    task_vars = task_embedder.init(
+        {"params": task_rng}, dummy_task_ids, cfg.env.B, cfg.env.T
+    )
 
-    fake_h = jnp.zeros((cfg.B, cfg.T, cfg.d_model_dyn), dtype=jnp.float32)
-    pi_vars  = policy_head.init({"params": rng_pi, "dropout": rng_pi}, fake_h, deterministic=True)
-    rew_vars = reward_head.init({"params": rng_rw, "dropout": rng_rw}, fake_h, deterministic=True)
+    fake_h = jnp.zeros((cfg.env.B, cfg.env.T, cfg.d_model), dtype=jnp.float32)
+    pi_vars  = policy_head.init(
+        {"params": pi_rng, "dropout": pi_rng}, fake_h, deterministic=True
+    )
+    rew_vars = reward_head.init(
+        {"params": rw_rng, "dropout": rw_rng}, fake_h, deterministic=True
+    )
 
     params = {
         "dyn": dyn_vars["params"],
@@ -826,6 +881,7 @@ def initialize_models_and_tokenizer(
 
 def run_evaluation(
     cfg: RealismConfig,
+    rng: Array,
     step: int,
     train_state: TrainState,
     next_batch,
@@ -834,16 +890,16 @@ def run_evaluation(
     """
     Run periodic evaluation: sample videos, compute metrics, and save visualization.
     """
-    val_rng = jax.random.PRNGKey(9999)
+    rng, val_rng = jax.random.split(rng)
     _, (val_frames, val_actions, val_rewards) = next_batch(val_rng)
     # UPDATED: bind only the dynamics params
     dyn_vars_eval = with_params(train_state.dyn_vars, train_state.params["dyn"])
-    ctx_length = min(32, cfg.T - 1)
+    ctx_length = min(32, cfg.env.T - 1)
     regimes = _eval_regimes_for_realism(cfg, ctx_length=ctx_length)
 
     for tag, sampler_conf in regimes:
         sampler_conf.mae_eval_key = train_state.mae_eval_key
-        sampler_conf.rng_key = jax.random.PRNGKey(4242)
+        rng, sampler_conf.rng_key = jax.random.split(rng)
         t0 = time.time()
 
         pred_frames, floor_frames, gt_frames = sample_video(
@@ -860,13 +916,20 @@ def run_evaluation(
         HZ = sampler_conf.horizon
         mse = float(jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2))
         psnr = float(10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12)))
-        print(f"[eval:{tag}] step={step:06d} | AR_hz={HZ} | MSE={mse:.6g} | PSNR={psnr:.2f} dB | {dt:.2f}s")
+        pieces = [
+            f"[eval:{tag}] step={step:06d}",
+            f"AR_hz={HZ}",
+            f"MSE={mse:.6g}",
+            f"PSNR={psnr:.2f} dB",
+            f"t={dt:.2f}s",
+        ]
+        print(" | ".join(pieces))
 
         grid_frames = build_tiled_video_frames(
             gt_frames=gt_frames,
             floor_frames=floor_frames,
             pred_frames=pred_frames,
-            batch_size=cfg.B,
+            batch_size=cfg.env.B,
         )
 
         tag_dir = _ensure_dir(vis_dir / f"step_{step:06d}")
@@ -890,22 +953,24 @@ def run_evaluation(
 # Main
 # ---------------------------
 
+@pyrallis.wrap()
 def run(cfg: RealismConfig):
+    pprint.pprint(asdict(cfg))
+
     # Initialize wandb if enabled
-    if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print("[warning] wandb requested but not installed. Install with: pip install wandb")
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+    if cfg.use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project,
+            name=cfg.run_name,
+            group=cfg.wandb_group or cfg.run_name,
+            config=asdict(cfg),
+            dir=str(Path(cfg.log_dir).resolve()),
+        )
+        print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+    else:
+        print("[warning] wandb not installed. Install with: pip install wandb")
+        print("[warning] Continuing without wandb logging.")
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
@@ -914,43 +979,56 @@ def run(cfg: RealismConfig):
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    rng = jax.random.PRNGKey(cfg.seed)
+
     # Data iterator (streaming)
-    next_batch = make_iterator(
-        cfg.B, cfg.T, cfg.H, cfg.W, cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min, size_max=cfg.size_max,
-        hold_min=cfg.hold_min, hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+    if cfg.env.env_type == "TinyEnv":
+        next_batch = make_iterator(
+            cfg.env.B, cfg.env.T, cfg.env.H, cfg.env.W, cfg.env.C,
+            cfg.env.pixels_per_step,
+            cfg.env.size_min, cfg.env.size_max,
+            cfg.env.hold_min, cfg.env.hold_max,
+            fg_min_color=0 if cfg.env.diversify_data else 128,
+            fg_max_color=255 if cfg.env.diversify_data else 128,
+            bg_min_color=0 if cfg.env.diversify_data else 255,
+            bg_max_color=255 if cfg.env.diversify_data else 255,
+        )
+    elif cfg.env.env_type == "Atari":
+        raise NotImplementedError("not implemented yet")
 
     # Initialize models and restore tokenizer
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, _) = next_batch(init_rng)
+    rng, (frames_init, actions_init, _) = next_batch(rng)
 
-    train_state = initialize_models_and_tokenizer(cfg, frames_init, actions_init)
+    rng, init_rng = jax.random.split(rng)
+    train_state = initialize_models_and_tokenizer(
+        cfg, init_rng, frames_init, actions_init
+    )
 
     # Extract some values for checkpointing
-    patch = cfg.patch
+    patch = cfg.tokenizer.patch
     k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
+    n_spatial = cfg.tokenizer.enc_n_latents // cfg.packing_factor
 
     # -------- Orbax manager & (optional) restore --------
-    mngr = make_manager(ckpt_dir, max_to_keep=cfg.ckpt_max_to_keep, save_interval_steps=cfg.ckpt_save_every)
+    mngr = make_manager(
+        ckpt_dir,
+        max_to_keep=cfg.ckpt_max_to_keep,
+        save_interval_steps=cfg.ckpt_save_every
+    )
     meta = make_dynamics_meta(
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H, W=cfg.W, C=cfg.C, patch=patch,
+        H=cfg.env.H, W=cfg.env.W, C=cfg.env.C, patch=patch,
         k_max=k_max, packing_factor=cfg.packing_factor, n_spatial=n_spatial,
         tokenizer_ckpt_dir=cfg.tokenizer_ckpt,
         cfg=asdict(cfg),
     )
 
-    rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
+    rng, state_rng = jax.random.split(rng)
+    state_example = make_state(
+        train_state.params, train_state.opt_state, state_rng, step=0
+    )
     restored = try_restore(mngr, state_example, meta)
 
     start_step = 0
@@ -961,24 +1039,28 @@ def run(cfg: RealismConfig):
         rng = r.state["rng"]
         start_step = int(r.state["step"]) + 1
         # UPDATED: bind subtrees into module vars
-        train_state.dyn_vars  = with_params(train_state.dyn_vars,  train_state.params["dyn"])
-        train_state.task_vars = with_params(train_state.task_vars, train_state.params["task"])
-        train_state.pi_vars   = with_params(train_state.pi_vars,   train_state.params["pi"])
-        train_state.rew_vars  = with_params(train_state.rew_vars,  train_state.params["rew"])
+        train_state.dyn_vars = with_params(
+            train_state.dyn_vars, train_state.params["dyn"]
+        )
+        train_state.task_vars = with_params(
+            train_state.task_vars, train_state.params["task"]
+        )
+        train_state.pi_vars = with_params(
+            train_state.pi_vars, train_state.params["pi"]
+        )
+        train_state.rew_vars = with_params(
+            train_state.rew_vars, train_state.params["rew"]
+        )
         print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
 
     # -------- Training loop --------
-    train_rng = jax.random.PRNGKey(2025)
-    data_rng = jax.random.PRNGKey(12345)
-
     start_wall = time.time()
     for step in range(start_step, cfg.max_steps + 1):
         # Data
-        data_rng, batch_key = jax.random.split(data_rng)
-        _, (frames, actions, rewards) = next_batch(batch_key)
+        rng, (frames, actions, rewards) = next_batch(rng)
 
         # RNG for this step
-        train_rng, master_key = jax.random.split(train_rng)
+        rng, master_key = jax.random.split(rng)
 
         # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
         # and gate its contribution inside the jit via bootstrap_start masking).
@@ -986,27 +1068,24 @@ def run(cfg: RealismConfig):
 
         train_step_start_time = time.time()
         train_state.params, train_state.opt_state, aux = train_step_efficient(
+            cfg,
             train_state.encoder, train_state.dynamics, train_state.task_embedder,
             train_state.policy_head, train_state.reward_head, train_state.tx,
             train_state.params, train_state.opt_state,
             train_state.enc_vars, train_state.dyn_vars, train_state.task_vars,
             train_state.pi_vars, train_state.rew_vars,
             frames, actions, rewards,
-            patch=cfg.patch, B=cfg.B, T=cfg.T, B_self=B_self,
-            n_spatial=n_spatial, k_max=k_max, packing_factor=cfg.packing_factor,
-            L=cfg.L,
-            master_key=master_key, step=step, bootstrap_start=cfg.bootstrap_start,
-            loss_weight_shortcut=cfg.loss_weight_shortcut,
-            loss_weight_policy=cfg.loss_weight_policy,
-            loss_weight_reward=cfg.loss_weight_reward,
+            B_self=B_self,
+            n_spatial=n_spatial,
+            master_key=master_key, step=step,
         )
 
         # Logging
         if (step % cfg.log_every == 0) or (step == cfg.max_steps):
             flow_mse = float(aux['flow_mse'])
             boot_mse = float(aux['bootstrap_mse'])
-            pi_ce    = float(aux['pi_ce'])   
-            rw_ce   = float(aux['rw_ce'])
+            pi_ce = float(aux['pi_ce'])
+            rw_ce = float(aux['rw_ce'])
             w_shortcut = float(aux['w_shortcut'])
             w_pi_ce = float(aux['w_pi_ce'])
             w_rw_ce = float(aux['w_rw_ce'])
@@ -1040,13 +1119,14 @@ def run(cfg: RealismConfig):
                 }, step=step)
 
         # Save (async) when policy says we should
-        state = make_state(train_state.params, train_state.opt_state, train_rng, step)
+        state = make_state(train_state.params, train_state.opt_state, rng, step)
         maybe_save(mngr, step, state, meta)
 
         # Periodic lightweight AR eval
         if cfg.write_video_every and (step % cfg.write_video_every == 0):
             run_evaluation(
                 cfg=cfg,
+                rng=rng,
                 step=step,
                 train_state=train_state,
                 next_batch=next_batch,
@@ -1066,24 +1146,4 @@ def run(cfg: RealismConfig):
 
 
 if __name__ == "__main__":
-    cfg = RealismConfig(
-        run_name="train_bc_rew_flippedrew_test",
-        tokenizer_ckpt="/storage/inhokim/dreamer4/test",
-        pretrained_dyn_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_ndynamics_newattn/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        max_steps=1_000_000_000,
-        log_every=5_000,
-        lr=1e-4,
-        write_video_every=100_000,
-        ckpt_save_every=100_000,
-        ckpt_max_to_keep=2,
-        loss_weight_shortcut=1.0,
-        loss_weight_policy=0.3,
-        loss_weight_reward=0.3,
-        action_dim=4,
-    )
-    print("Running realism config:\n  " + "\n  ".join([f"{k}={v}" for k,v in asdict(cfg).items()]))
-    run(cfg)
+    run()
