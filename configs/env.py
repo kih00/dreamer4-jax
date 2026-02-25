@@ -27,9 +27,12 @@ class AtariConfig:
     H: int = 64
     W: int = 64
     C: int = 3
+    pixels_per_step: int = 4
     frame_stack: int = 4
     grayscale: bool = True
     resize_height: int = 84
     resize_width: int = 84
+    diversify_data: bool = True
+    action_dim: int = 17
 
 EnvConfig = Union[TinyEnvConfig, AtariConfig]

@@ -7,6 +7,7 @@ from typing import Dict, Any
 from functools import partial
 import json
 import time
+from datetime import datetime
 import math
 import pprint
 from einops import reduce
@@ -540,7 +541,7 @@ def build_tiled_video_frames(
     floor_frames: Array,
     pred_frames: Array,
     batch_size: int,
-) -> list[Array]:  # list of np arrays
+) -> list[Array]:
     """
     Build tiled video frames from ground truth, floor, and prediction frames.
 
@@ -554,7 +555,7 @@ def build_tiled_video_frames(
         batch_size: Batch size B
 
     Returns:
-        List of grid frames, one per time step
+        List of grid frames (as np arrays), one per time step
     """
     gt_np_all = _to_uint8(gt_frames)
     floor_np_all = _to_uint8(floor_frames)
@@ -579,7 +580,7 @@ def build_tiled_video_frames(
     return grid_frames
 
 def save_evaluation_video(
-    grid_frames: list[Array],  # np arrays
+    grid_frames: list[Array],
     output_path: Path,
     tag: str,
 ) -> bool:
@@ -587,7 +588,7 @@ def save_evaluation_video(
     Save grid frames as an MP4 video file.
 
     Args:
-        grid_frames: List of grid frames to write
+        grid_frames: List of grid frames (as np arrays) to write
         output_path: Path where MP4 should be saved
         tag: Tag for error messages
 
@@ -725,6 +726,7 @@ def initialize_models_and_tokenizer(
     patch = cfg.tokenizer.patch
     num_patches = (cfg.env.H // patch) * (cfg.env.W // patch)
     D_patch = patch * patch * cfg.env.C
+    k_max = cfg.k_max
 
     tok_cfg = cfg.tokenizer
     enc_kwargs = dict(
@@ -750,13 +752,13 @@ def initialize_models_and_tokenizer(
     )
     n_spatial = tok_cfg.enc_n_latents // cfg.packing_factor # number of spatial tokens for dynamics
     dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
+        d_model=cfg.d_model,
         d_bottleneck=tok_cfg.enc_d_bottleneck,
         d_spatial=tok_cfg.enc_d_bottleneck * cfg.packing_factor,
         n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=tok_cfg.n_heads, depth=cfg.depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=cfg.k_max, 
+        dropout=0.0, k_max=k_max, 
         time_every=4,
     )
 
@@ -797,9 +799,9 @@ def initialize_models_and_tokenizer(
     z1 = pack_bottleneck_to_spatial(
         z_btLd, n_spatial=n_spatial, k=cfg.packing_factor
     )
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
+    emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.env.B, cfg.env.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), cfg.k_max - 1, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), k_max - 1, dtype=jnp.int32)
     rng, dyn_rng = jax.random.split(rng)
     dyn_vars = dynamics.init(
         {"params": dyn_rng, "dropout": dyn_rng},
@@ -957,12 +959,14 @@ def run_evaluation(
 def run(cfg: RealismConfig):
     pprint.pprint(asdict(cfg))
 
+    date = datetime.now().strftime("%m%d-%H%M")
+    run_name = f"{cfg.run_name}_seed{cfg.seed}_{date}"
     # Initialize wandb if enabled
     if cfg.use_wandb and WANDB_AVAILABLE:
         wandb.init(
             entity=cfg.wandb_entity,
             project=cfg.wandb_project,
-            name=cfg.run_name,
+            name=run_name,
             group=cfg.wandb_group or cfg.run_name,
             config=asdict(cfg),
             dir=str(Path(cfg.log_dir).resolve()),
@@ -974,7 +978,7 @@ def run(cfg: RealismConfig):
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
+    run_dir = _ensure_dir(root / run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
@@ -1064,7 +1068,7 @@ def run(cfg: RealismConfig):
 
         # Decide current B_self based on warm-up (static arg requires a single value; we keep B_self fixed
         # and gate its contribution inside the jit via bootstrap_start masking).
-        B_self = max(0, int(round(cfg.self_fraction * cfg.B)))
+        B_self = max(0, int(round(cfg.self_fraction * cfg.env.B)))
 
         train_step_start_time = time.time()
         train_state.params, train_state.opt_state, aux = train_step_efficient(

@@ -8,11 +8,13 @@ from typing import Dict, Any
 from functools import partial
 import json
 import time
+from datetime import datetime
 import math
 import pprint
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array
 import numpy as np
 import optax
 import imageio.v2 as imageio
@@ -53,7 +55,12 @@ def _to_uint8(img_f32):
 def _stack_wide(*imgs_hwC):
     return np.concatenate(imgs_hwC, axis=1)
 
-def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: int = 0) -> np.ndarray:
+def _tile_videos(
+    trip_list_hwC: list[Array],  # list of (H, W*3, C) np arrays
+    *,
+    ncols: int = 2,
+    pad_color: int = 0
+) -> Array:
     if len(trip_list_hwC) == 0:
         raise ValueError("Empty video list")
     H, W3, C = trip_list_hwC[0].shape
@@ -79,7 +86,7 @@ def _tile_videos(trip_list_hwC: list[np.ndarray], *, ncols: int = 2, pad_color: 
 def load_pretrained_tokenizer(
     tokenizer_ckpt_dir: str,
     *,
-    rng: jnp.ndarray,
+    rng: Array,
     encoder: Encoder,
     decoder: Decoder,
     enc_vars,
@@ -150,7 +157,7 @@ def train_step_efficient(
     *,
     B_self: int,            # assume 0 <= B_self < B
     n_spatial: int,
-    master_key: jnp.ndarray, step: int,
+    master_key: Array, step: int,
 ):
     """
     Deterministic two-branch training (one fused main forward):
@@ -161,7 +168,7 @@ def train_step_efficient(
     """
     @partial(jax.jit, static_argnames=("shape_bt", "k_max",))
     def _sample_tau_for_step(
-        rng, shape_bt, k_max: int, step_idx: jnp.ndarray, *, dtype=jnp.float32
+        rng, shape_bt, k_max: int, step_idx: Array, *, dtype=jnp.float32
     ):
         B_, T_ = shape_bt
         K = (1 << step_idx)
@@ -386,11 +393,11 @@ def _plan_from_sampler_conf(s: SamplerConfig) -> Dict[str, Any]:
 # ---------------------------
 
 def build_tiled_video_frames(
-    gt_frames: jnp.ndarray,
-    floor_frames: jnp.ndarray,
-    pred_frames: jnp.ndarray,
+    gt_frames: Array,
+    floor_frames: Array,
+    pred_frames: Array,
     batch_size: int,
-) -> list[np.ndarray]:
+) -> list[Array]:
     """
     Build tiled video frames from ground truth, floor, and prediction frames.
 
@@ -404,7 +411,7 @@ def build_tiled_video_frames(
         batch_size: Batch size B
 
     Returns:
-        List of grid frames, one per time step
+        List of grid frames (as np arrays), one per time step
     """
     gt_np_all = _to_uint8(gt_frames)
     floor_np_all = _to_uint8(floor_frames)
@@ -425,7 +432,7 @@ def build_tiled_video_frames(
     return grid_frames
 
 def save_evaluation_video(
-    grid_frames: list[np.ndarray],
+    grid_frames: list[Array],
     output_path: Path,
     tag: str,
 ) -> bool:
@@ -433,7 +440,7 @@ def save_evaluation_video(
     Save grid frames as an MP4 video file.
 
     Args:
-        grid_frames: List of grid frames to write
+        grid_frames: List of grid frames (as np arrays) to write
         output_path: Path where MP4 should be saved
         tag: Tag for error messages
 
@@ -522,7 +529,7 @@ class TrainState:
     dyn_kwargs: dict
     tx: optax.transforms
     opt_state: optax.OptState
-    mae_eval_key: jnp.ndarray
+    mae_eval_key: Array
 
 # ---------------------------
 # Model initialization
@@ -530,21 +537,28 @@ class TrainState:
 
 def initialize_models_and_tokenizer(
     cfg: RealismConfig,
-    rng: jnp.ndarray,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
+    rng: Array,
+    frames_init: Array,
+    actions_init: Array,
 ) -> TrainState:
     """
     Initialize encoder, decoder, dynamics models and restore tokenizer.
 
+    Args:
+        cfg: Configuration object
+        rng: JAX random key
+        frames_init: Numpy array of initial frames for shape inference
+        actions_init: Numpy array of initial actions for shape inference
+
     Returns:
         TrainState containing all initialized models, variables, and optimizer state.
     """
-    patch = cfg.tokenizer.patch
+    tok_cfg = cfg.tokenizer
+    patch = tok_cfg.patch
     num_patches = (cfg.env.H // patch) * (cfg.env.W // patch)
     D_patch = patch * patch * cfg.env.C
+    k_max = cfg.k_max
 
-    tok_cfg = cfg.tokenizer
     enc_kwargs = dict(
         d_model=tok_cfg.d_model,
         n_latents=tok_cfg.enc_n_latents,
@@ -574,7 +588,7 @@ def initialize_models_and_tokenizer(
         n_spatial=n_spatial, n_register=cfg.n_register,
         n_heads=tok_cfg.n_heads, depth=cfg.depth,
         space_mode=cfg.agent_space_mode, n_agent=cfg.n_agent,
-        dropout=0.0, k_max=cfg.k_max, 
+        dropout=0.0, k_max=k_max, 
         time_every=4,
     )
 
@@ -611,9 +625,9 @@ def initialize_models_and_tokenizer(
     z1 = pack_bottleneck_to_spatial(
         z_btLd, n_spatial=n_spatial, k=cfg.packing_factor
     )
-    emax = jnp.log2(cfg.k_max).astype(jnp.int32)
+    emax = jnp.log2(k_max).astype(jnp.int32)
     step_idx = jnp.full((cfg.env.B, cfg.env.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), cfg.k_max - 1, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init(
         {"params": rng, "dropout": rng}, actions_init, step_idx, sigma_idx, z1
     )
@@ -644,7 +658,7 @@ def initialize_models_and_tokenizer(
 
 def run_evaluation(
     cfg: RealismConfig,
-    rng: jnp.ndarray,
+    rng: Array,
     step: int,
     train_state: TrainState,
     next_batch,
@@ -734,12 +748,14 @@ def run_evaluation(
 def run(cfg: RealismConfig):
     pprint.pprint(asdict(cfg))
 
+    date = datetime.now().strftime("%m%d-%H%M")
+    run_name = f"{cfg.run_name}_seed{cfg.seed}_{date}"
     # Initialize wandb if enabled
     if cfg.use_wandb and WANDB_AVAILABLE:
         wandb.init(
             entity=cfg.wandb_entity,
             project=cfg.wandb_project,
-            name=cfg.run_name,
+            name=run_name,
             group=cfg.wandb_group or cfg.run_name,
             config=asdict(cfg),
             dir=str(Path(cfg.log_dir).resolve()),
@@ -751,7 +767,7 @@ def run(cfg: RealismConfig):
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
+    run_dir = _ensure_dir(root / run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")

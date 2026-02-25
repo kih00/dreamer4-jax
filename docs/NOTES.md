@@ -55,12 +55,8 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
 - [ ] Clean up code in preparation for CoinRun
     - [x] Remove unused files
     - [ ] Document how to reproduce
-- [ ] Refactor codebase from Flax Linen to Flax NNX
-    - [ ] Causal Tokenizer
-    - [ ] Interactive Dynamics Model
-    - [ ] Imagination training
-- [ ] CoinRun experiment
-    - [ ] CoinRun dataloading
+- [ ] Atari experiment
+    - [ ] Atari dataloading
         - [ ] MAE training
         - [ ] Dynamics training
         - [ ] Dynamics finetuning
@@ -69,6 +65,10 @@ See implementation progress log [here](https://docs.google.com/presentation/d/1H
         - [ ] Continue predictor
         - [ ] GQA
         - [ ] RoPE embeddings
+- [ ] Refactor codebase from Flax Linen to Flax NNX
+    - [ ] Causal Tokenizer
+    - [ ] Interactive Dynamics Model
+    - [ ] Imagination training
 </details>
 
 ## Installation

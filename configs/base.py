@@ -4,7 +4,7 @@ from configs.env import *
 
 @dataclass(frozen=True)
 class TokenizerConfig:
-    run_name: str = "tokenizer_tinyenv"
+    run_name: str = "test"
     log_dir: str = "/storage/inhokim/dreamer4-tinyenv/tokenizer"
     ckpt_max_to_keep: int = 5
     ckpt_save_every: int = 10_000
@@ -55,7 +55,7 @@ class MTPConfig:
 @dataclass(frozen=True)
 class RealismConfig:
     # IO / ckpt
-    run_name: str = "dynamics_tinyenv"
+    run_name: str = "test"
     tokenizer_ckpt: str = "/storage/inhokim/dreamer4-tinyenv/<tokenizer_path>"
     pretrained_dyn_ckpt: str = "/storage/inhokim/dreamer4-tinyenv/<dynamics_path>"
     log_dir: str = "./<log_path>"
@@ -111,11 +111,11 @@ class RealismConfig:
 @dataclass(frozen=True)
 class RLConfig:
     # IO / ckpt
-    run_name: str
-    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
+    run_name: str = "test"
+    bc_rew_ckpt: str = "/storage/inhokim/dreamer4-tinyenv/<bc_rew_heads_path>"
     log_dir: str = "./logs"
     ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
+    ckpt_save_every: int = 100_000  # 10_000
 
     # wandb config
     use_wandb: bool = False
@@ -128,25 +128,26 @@ class RLConfig:
 
     # tokenizer / dynamics config
     dynamics: RealismConfig = RealismConfig()
-    tokenizer: TokenizerConfig = dynamics.tokenizer
+    tokenizer: TokenizerConfig = TokenizerConfig()
 
     # schedule
     k_max: int = 8
 
     # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
+    seed: int = 0
+    max_steps: int = 100_000  # 1_000_000_000
+    log_every: int = 100  # 5_000
+    lr: float = 1e-4  # 3e-4
 
     # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
+    write_video_every: int = 1  # 10_000
+    visualize_every: int = 1  # 25_000
 
     # RL-specific
     mtp: MTPConfig = MTPConfig()
 
     # RL hyperparameters
-    gamma: float = 0.997
+    gamma: float = 0.9  # 0.997
     lambda_: float = 0.95
     horizon: int = 32
     context_length: int = 16
@@ -155,8 +156,8 @@ class RLConfig:
     beta: float = 0.3
 
     # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
+    eval_every: int = 5000  # 50_000
+    eval_episodes: int = 64  # 4
     eval_horizon: int = 32
-    eval_batch_size: int = 4
+    eval_batch_size: int = 64  # 4
     max_eval_examples_to_plot: int = 4

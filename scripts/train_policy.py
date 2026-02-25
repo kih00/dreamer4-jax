@@ -17,16 +17,18 @@ High-level outline (from the docstring plan):
     - Train V_head on (s0…s{T-1}) to regress G0…G{T-1}.
     - Train policy head on (s0…s{T-1}, a1…aT, G0…G{T-1}, V0…V{T-1}) using PMPO.
 """
-from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Any
 from functools import partial
 import time
+from datetime import datetime
 import math
+import pprint
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float, Int, Bool
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
@@ -34,14 +36,13 @@ from einops import rearrange
 from flax import struct
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
-
 try:
     import wandb
-
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
+import pyrallis
 
 from dreamer.models import (
     Encoder,
@@ -69,92 +70,7 @@ from dreamer.imagination import (
     _build_static_schedule,
     imagine_rollouts_core,
 )
-
-
-# ---------------------------
-# Config
-# ---------------------------
-
-
-@dataclass(frozen=True)
-class RLConfig:
-    # IO / ckpt
-    run_name: str
-    bc_rew_ckpt: str  # checkpoint from train_bc_rew_heads.py
-    log_dir: str = "./logs"
-    ckpt_max_to_keep: int = 2
-    ckpt_save_every: int = 10_000
-
-    # wandb config
-    use_wandb: bool = False
-    wandb_entity: str | None = None
-    wandb_project: str | None = None
-
-    # data
-    B: int = 64
-    T: int = 64
-    H: int = 32
-    W: int = 32
-    C: int = 3
-    pixels_per_step: int = 2
-    size_min: int = 6
-    size_max: int = 14
-    hold_min: int = 4
-    hold_max: int = 9
-    diversify_data: bool = True
-    action_dim: int = 4
-
-    # tokenizer / dynamics config
-    patch: int = 4
-    enc_n_latents: int = 16
-    enc_d_bottleneck: int = 32
-    d_model_enc: int = 64
-    d_model_dyn: int = 128
-    enc_depth: int = 8
-    dec_depth: int = 8
-    dyn_depth: int = 8
-    n_heads: int = 4
-    packing_factor: int = 2
-    n_register: int = 4
-    n_agent: int = 1
-    agent_space_mode: str = "wm_agent"
-
-    # schedule
-    k_max: int = 8
-
-    # train
-    max_steps: int = 1_000_000_000
-    log_every: int = 5_000
-    lr: float = 3e-4
-
-    # eval media toggle
-    write_video_every: int = 10_000
-    visualize_every: int = 25_000
-
-    # RL-specific
-    L: int = 2
-    num_reward_bins: int = 101
-    reward_log_low: float = -3.0
-    reward_log_high: float = 3.0
-    num_value_bins: int = 101
-    n_tasks: int = 128
-    use_task_ids: bool = True
-
-    # RL hyperparameters
-    gamma: float = 0.997
-    lambda_: float = 0.95
-    horizon: int = 32
-    context_length: int = 16
-    imagination_d: float = 1.0 / 4
-    alpha: float = 0.5
-    beta: float = 0.3
-
-    # Evaluation
-    eval_every: int = 50_000
-    eval_episodes: int = 4
-    eval_horizon: int = 32
-    eval_batch_size: int = 4
-    max_eval_examples_to_plot: int = 4
+from configs.base import RLConfig
 
 
 # ---------------------------
@@ -173,13 +89,15 @@ def _to_uint8(img_f32: np.ndarray) -> np.ndarray:
 
 
 def _tile_frames_grid(
-    frames_b_hwc: np.ndarray,
+    frames_b_hwc: Array,
     *,
     ncols: int = 2,
     pad_color: int = 0,
-) -> np.ndarray:
+) -> Array:
     """
     Tile a batch of frames (B, H, W, C) into a grid image (H*nrows, W*ncols, C).
+
+    frame_b_hwc: np array (B, H, W, C)
     """
     B, H, W, C = frames_b_hwc.shape
     nrows = math.ceil(B / ncols)
@@ -202,14 +120,14 @@ def _tile_frames_grid(
 
 def _save_real_env_grid_video(
     out_path: Path,
-    frames_b_t_hwc: np.ndarray,
+    frames_b_t_hwc: Array,
     *,
     fps: int = 25,
 ) -> None:
     """
     Save a grid MP4 summarizing all episodes in a real-env eval rollout.
 
-    frames_b_t_hwc: (B, T, H, W, C) float32 in [0,1] or uint8.
+    frames_b_t_hwc: np array (B, T, H, W, C) float32 in [0,1] or uint8.
     """
     frames_np = _to_uint8(frames_b_t_hwc)
     B, T = frames_np.shape[:2]
@@ -226,9 +144,9 @@ def _save_real_env_grid_video(
 
 def _save_real_env_strip(
     fig_path: Path,
-    frames_b_t_hwc: np.ndarray,
-    actions_bt: np.ndarray,
-    rewards_bt: np.ndarray,
+    frames_b_t_hwc: Float[Array, "B T H W C"],
+    actions_bt: Int[Array, "B T"],
+    rewards_bt: Float[Array, "B T"],
     *,
     title: str,
     b_index: int = 0,
@@ -307,15 +225,15 @@ def _save_real_env_strip(
     static_argnames=("context_length", "H", "W", "C"),
 )
 def sample_contexts(
-    videos: jnp.ndarray,  # (B, T, H, W, C)
-    actions: jnp.ndarray,  # (B, T)
-    rewards: jnp.ndarray,  # (B, T)
-    rng: jnp.ndarray,
+    videos: Float[Array, "B T H W C"],
+    actions: Int[Array, "B T"],
+    rewards: Float[Array, "B T"],
+    rng: Array,
     context_length: int,
     H: int,
     W: int,
     C: int,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[Array, Array, Array]:
     """
     Sample valid contexts from videos.
 
@@ -361,7 +279,7 @@ def sample_contexts(
 def load_pretrained_tokenizer(
     tokenizer_ckpt_dir: str,
     *,
-    rng: jnp.ndarray,
+    rng: Array,
     encoder: Encoder,
     decoder: Decoder,
     enc_vars,
@@ -374,7 +292,9 @@ def load_pretrained_tokenizer(
     meta_mngr = make_manager(tokenizer_ckpt_dir, item_names=("meta",))
     latest = meta_mngr.latest_step()
     if latest is None:
-        raise FileNotFoundError(f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}")
+        raise FileNotFoundError(
+            f"No tokenizer checkpoint found in {tokenizer_ckpt_dir}"
+        )
     restored_meta = meta_mngr.restore(
         latest,
         args=ocp.args.Composite(meta=ocp.args.JsonRestore()),
@@ -413,14 +333,17 @@ def load_pretrained_tokenizer(
     dec_params = packed_params["dec"]
     new_enc_vars = with_params(enc_vars, enc_params)
     new_dec_vars = with_params(dec_vars, dec_params)
-    print(f"[tokenizer] Restored encoder/decoder from {tokenizer_ckpt_dir} (step {latest})")
+    print(
+        f"[tokenizer] Restored encoder/decoder "
+        f"from {tokenizer_ckpt_dir} (step {latest})"
+    )
     return new_enc_vars, new_dec_vars, meta
 
 
 def load_bc_rew_checkpoint(
     bc_rew_ckpt_dir: str,
     *,
-    rng: jnp.ndarray,
+    rng: Array,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
     policy_head_bc: PolicyHeadMTP,
@@ -469,7 +392,13 @@ def load_bc_rew_checkpoint(
         f"[bc_rew] Restored dynamics/task/policy_bc/reward "
         f"from {bc_rew_ckpt_dir} (step {latest_step})"
     )
-    return dyn_vars_loaded, task_vars_loaded, pi_bc_vars_loaded, rew_vars_loaded, meta
+    return (
+        dyn_vars_loaded,
+        task_vars_loaded,
+        pi_bc_vars_loaded,
+        rew_vars_loaded,
+        meta,
+    )
 
 
 # ---------------------------
@@ -510,7 +439,7 @@ class TrainState:
     enc_kwargs: dict
     dec_kwargs: dict
     dyn_kwargs: dict
-    tx: optax.Transform
+    tx: optax.transforms
     opt_state: optax.OptState
     mae_eval_key: jnp.ndarray
 
@@ -519,10 +448,10 @@ class TrainState:
 class EpisodeResult:
     """JAX-friendly container for a batch of evaluation rollouts."""
 
-    frames: jnp.ndarray   # (B, horizon+1, H, W, C)
-    actions: jnp.ndarray  # (B, horizon+1)
-    rewards: jnp.ndarray  # (B, horizon+1)
-    returns: jnp.ndarray  # (B,)
+    frames: Array   # (B, horizon+1, H, W, C)
+    actions: Array  # (B, horizon+1)
+    rewards: Array  # (B, horizon+1)
+    returns: Array  # (B,)
 
 
 # ---------------------------
@@ -532,35 +461,39 @@ class EpisodeResult:
 
 def initialize_models(
     cfg: RLConfig,
-    frames_init: jnp.ndarray,
-    actions_init: jnp.ndarray,
+    rng: Array,
+    frames_init: Array,
+    actions_init: Array,
 ) -> TrainState:
     """
     Initialize all models and load pretrained checkpoints.
     """
-    patch = cfg.patch
-    num_patches = (cfg.H // patch) * (cfg.W // patch)
-    D_patch = patch * patch * cfg.C
+    tok_cfg = cfg.tokenizer
+    dyn_cfg = cfg.dynamics
+
+    patch = tok_cfg.patch
+    num_patches = (cfg.env.H // patch) * (cfg.env.W // patch)
+    D_patch = patch * patch * cfg.env.C
     k_max = cfg.k_max
 
     enc_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_latents=cfg.enc_n_latents,
+        d_model=tok_cfg.d_model,
+        n_latents=tok_cfg.enc_n_latents,
         n_patches=num_patches,
-        n_heads=cfg.n_heads,
-        depth=cfg.enc_depth,
+        n_heads=tok_cfg.n_heads,
+        depth=tok_cfg.enc_depth,
         dropout=0.0,
-        d_bottleneck=cfg.enc_d_bottleneck,
+        d_bottleneck=tok_cfg.enc_d_bottleneck,
         mae_p_min=0.0,
         mae_p_max=0.0,
         time_every=4,
         latents_only_time=True,
     )
     dec_kwargs = dict(
-        d_model=cfg.d_model_enc,
-        n_heads=cfg.n_heads,
-        depth=cfg.dec_depth,
-        n_latents=cfg.enc_n_latents,
+        d_model=tok_cfg.d_model,
+        n_heads=tok_cfg.n_heads,
+        depth=tok_cfg.dec_depth,
+        n_latents=tok_cfg.enc_n_latents,
         n_patches=num_patches,
         d_patch=D_patch,
         dropout=0.0,
@@ -568,17 +501,17 @@ def initialize_models(
         time_every=4,
         latents_only_time=True,
     )
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
+    n_spatial = tok_cfg.enc_n_latents // dyn_cfg.packing_factor
     dyn_kwargs = dict(
-        d_model=cfg.d_model_dyn,
-        d_bottleneck=cfg.enc_d_bottleneck,
-        d_spatial=cfg.enc_d_bottleneck * cfg.packing_factor,
+        d_model=dyn_cfg.d_model,
+        d_bottleneck=tok_cfg.enc_d_bottleneck,
+        d_spatial=tok_cfg.enc_d_bottleneck * dyn_cfg.packing_factor,
         n_spatial=n_spatial,
-        n_register=cfg.n_register,
-        n_heads=cfg.n_heads,
-        depth=cfg.dyn_depth,
-        space_mode=cfg.agent_space_mode,
-        n_agent=cfg.n_agent,
+        n_register=dyn_cfg.n_register,
+        n_heads=tok_cfg.n_heads,
+        depth=dyn_cfg.depth,
+        space_mode=dyn_cfg.agent_space_mode,
+        n_agent=dyn_cfg.n_agent,
         dropout=0.0,
         k_max=k_max,
         time_every=4,
@@ -587,48 +520,51 @@ def initialize_models(
     encoder = Encoder(**enc_kwargs)
     decoder = Decoder(**dec_kwargs)
     dynamics = Dynamics(**dyn_kwargs)
+
+    mtp_cfg = dyn_cfg.mtp
     task_embedder = TaskEmbedder(
-        d_model=cfg.d_model_dyn,
-        n_agent=cfg.n_agent,
-        use_ids=cfg.use_task_ids,
-        n_tasks=cfg.n_tasks,
+        d_model=dyn_cfg.d_model,
+        n_agent=dyn_cfg.n_agent,
+        use_ids=mtp_cfg.use_task_ids,
+        n_tasks=mtp_cfg.n_tasks,
     )
     policy_head_bc = PolicyHeadMTP(
-        d_model=cfg.d_model_dyn,
-        action_dim=cfg.action_dim,
-        L=cfg.L,
+        d_model=dyn_cfg.d_model,
+        action_dim=cfg.env.action_dim,
+        L=mtp_cfg.L,
     )
     reward_head = RewardHeadMTP(
-        d_model=cfg.d_model_dyn,
-        L=cfg.L,
-        num_bins=cfg.num_reward_bins,
-        log_low=cfg.reward_log_low,
-        log_high=cfg.reward_log_high,
+        d_model=dyn_cfg.d_model,
+        L=mtp_cfg.L,
+        num_bins=mtp_cfg.num_reward_bins,
+        log_low=mtp_cfg.reward_log_low,
+        log_high=mtp_cfg.reward_log_high,
     )
 
     policy_head = PolicyHeadMTP(
-        d_model=cfg.d_model_dyn,
-        action_dim=cfg.action_dim,
-        L=cfg.L,
+        d_model=dyn_cfg.d_model,
+        action_dim=cfg.env.action_dim,
+        L=mtp_cfg.L,
     )
     value_head = ValueHead(
-        d_model=cfg.d_model_dyn,
-        num_bins=cfg.num_value_bins,
+        d_model=dyn_cfg.d_model,
+        num_bins=mtp_cfg.num_value_bins,
     )
 
-    rng = jax.random.PRNGKey(0)
     patches_btnd = temporal_patchify(frames_init, patch)
+    rng, enc_rng = jax.random.split(rng)
     enc_vars = encoder.init(
-        {"params": rng, "mae": rng, "dropout": rng},
+        {"params": enc_rng, "mae": enc_rng, "dropout": enc_rng},
         patches_btnd,
         deterministic=True,
     )
     fake_z = jnp.zeros(
-        (cfg.B, cfg.T, cfg.enc_n_latents, cfg.enc_d_bottleneck),
+        (cfg.env.B, cfg.env.T, tok_cfg.enc_n_latents, tok_cfg.enc_d_bottleneck),
         dtype=jnp.float32,
     )
+    rng, dec_rng = jax.random.split(rng)
     dec_vars = decoder.init(
-        {"params": rng, "dropout": rng},
+        {"params": dec_rng, "dropout": dec_rng},
         fake_z,
         deterministic=True,
     )
@@ -661,7 +597,7 @@ def initialize_models(
         sample_patches_btnd=patches_btnd,
     )
 
-    mae_eval_key = jax.random.PRNGKey(777)
+    rng, mae_eval_key = jax.random.split(rng)
     z_btLd, _ = encoder.apply(
         enc_vars,
         patches_btnd,
@@ -671,11 +607,11 @@ def initialize_models(
     z1 = pack_bottleneck_to_spatial(
         z_btLd,
         n_spatial=n_spatial,
-        k=cfg.packing_factor,
+        k=cfg.dynamics.packing_factor,
     )
     emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jnp.full((cfg.B, cfg.T), emax, dtype=jnp.int32)
-    sigma_idx = jnp.full((cfg.B, cfg.T), k_max - 1, dtype=jnp.int32)
+    step_idx = jnp.full((cfg.env.B, cfg.env.T), emax, dtype=jnp.int32)
+    sigma_idx = jnp.full((cfg.env.B, cfg.env.T), k_max - 1, dtype=jnp.int32)
     dyn_vars = dynamics.init(
         {"params": rng, "dropout": rng},
         actions_init,
@@ -684,26 +620,26 @@ def initialize_models(
         z1,
     )
 
-    rng_task, rng_pi_bc, rng_rw = jax.random.split(jax.random.PRNGKey(1), 3)
-    dummy_task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+    rng, task_rng, pi_bc_rng, rw_rng = jax.random.split(rng, 4)
+    dummy_task_ids = jnp.zeros((cfg.env.B,), dtype=jnp.int32)
     task_vars = task_embedder.init(
-        {"params": rng_task},
+        {"params": task_rng},
         dummy_task_ids,
-        cfg.B,
-        cfg.T,
+        cfg.env.B,
+        cfg.env.T,
     )
 
     fake_h = jnp.zeros(
-        (cfg.B, cfg.T, cfg.d_model_dyn),
+        (cfg.env.B, cfg.env.T, dyn_cfg.d_model),
         dtype=jnp.float32,
     )
     pi_bc_vars = policy_head_bc.init(
-        {"params": rng_pi_bc, "dropout": rng_pi_bc},
+        {"params": pi_bc_rng, "dropout": pi_bc_rng},
         fake_h,
         deterministic=True,
     )
     rew_vars = reward_head.init(
-        {"params": rng_rw, "dropout": rng_rw},
+        {"params": rw_rng, "dropout": rw_rng},
         fake_h,
         deterministic=True,
     )
@@ -723,14 +659,14 @@ def initialize_models(
         sample_z1=z1,
     )
 
-    rng_pi, rng_val = jax.random.split(jax.random.PRNGKey(2), 2)
+    pi_rng, val_rng = jax.random.split(rng, 2)
     pi_vars = policy_head.init(
-        {"params": rng_pi, "dropout": rng_pi},
+        {"params": pi_rng, "dropout": pi_rng},
         fake_h,
         deterministic=True,
     )
     val_vars = value_head.init(
-        {"params": rng_val, "dropout": rng_val},
+        {"params": val_rng, "dropout": val_rng},
         fake_h,
         deterministic=True,
     )
@@ -812,11 +748,11 @@ def make_rl_meta(
 
 
 def encode_frames_to_spatial(
-    frames: jnp.ndarray,
+    frames: Array,
     *,
     encoder: Encoder,
     enc_vars: dict,
-    mae_eval_key: jnp.ndarray,
+    mae_eval_key: Array,
     patch: int,
     n_spatial: int,
     packing_factor: int,
@@ -846,8 +782,8 @@ def encode_frames_to_spatial(
 
 
 def compute_hidden_from_context(
-    z_ctx: jnp.ndarray,
-    actions_ctx: jnp.ndarray,
+    z_ctx: Array,
+    actions_ctx: Array,
     *,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -903,13 +839,13 @@ def compute_hidden_from_context(
 
 
 def sample_action_from_policy(
-    h_t: jnp.ndarray,
+    h_t: Array,
     *,
     policy_head: PolicyHeadMTP,
     pi_vars: dict,
-    rng: jax.Array | None = None,
+    rng: Array | None = None,
     greedy: bool = True,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[Array, Array]:
     """
     Sample an action from the policy head given the current hidden state.
 
@@ -1160,7 +1096,7 @@ def evaluate_policy_real_env(
     High-level helper that runs `eval_rollout_real_env` for multiple episodes,
     aggregates metrics, and returns episode data for visualization.
     """
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
+    n_spatial = cfg.tokenizer.enc_n_latents // cfg.dynamics.packing_factor
     horizon = cfg.eval_horizon
     batch_size = cfg.eval_batch_size
 
@@ -1188,9 +1124,9 @@ def evaluate_policy_real_env(
             env_step_fn=env_step_fn,
             task_ids=task_ids,
             horizon=horizon,
-            patch=cfg.patch,
+            patch=cfg.tokenizer.patch,
             n_spatial=n_spatial,
-            packing_factor=cfg.packing_factor,
+            packing_factor=cfg.dynamics.packing_factor,
             max_context=cfg.context_length,
             schedule_step_idx=schedule_step_idx,
             k_max=k_max,
@@ -1230,6 +1166,7 @@ def evaluate_policy_real_env(
 @partial(
     jax.jit,
     static_argnames=(
+        "cfg",
         "encoder",
         "dynamics",
         "task_embedder",
@@ -1238,19 +1175,12 @@ def evaluate_policy_real_env(
         "policy_head",
         "policy_head_bc",
         "tx",
-        "horizon",
-        "gamma",
-        "lambda_",
-        "alpha",
-        "beta",
-        "context_length",
-        "patch",
         "n_spatial",
-        "packing_factor",
     ),
 )
 def train_step(
     *,
+    cfg: RLConfig,
     encoder: Encoder,
     dynamics: Dynamics,
     task_embedder: TaskEmbedder,
@@ -1258,7 +1188,7 @@ def train_step(
     value_head: ValueHead,
     policy_head: PolicyHeadMTP,
     policy_head_bc: PolicyHeadMTP,
-    tx: optax.Transform,
+    tx: optax.transforms,
     params: dict,
     opt_state: optax.OptState,
     enc_vars: dict,
@@ -1268,22 +1198,14 @@ def train_step(
     val_vars: dict,
     pi_vars: dict,
     pi_bc_vars: dict,
-    mae_eval_key: jnp.ndarray,
+    mae_eval_key: Array,
     schedule: DenoiseSchedule,
-    videos: jnp.ndarray,  # (B, T, H, W, C)
-    actions_full: jnp.ndarray,  # (B, T)
-    rewards_full: jnp.ndarray,  # (B, T)
-    task_ids: jnp.ndarray,  # (B,)
-    horizon: int,
-    gamma: float,
-    lambda_: float,
-    alpha: float,
-    beta: float,
-    context_length: int,
-    patch: int,
+    videos: Float[Array, "B T H W C"],
+    actions_full: Int[Array, "B T"],
+    rewards_full: Float[Array, "B T"],
+    task_ids: Int[Array, "B"],
     n_spatial: int,
-    packing_factor: int,
-    rng_key: jax.Array,
+    rng: Array,
 ):
     """
     Single training step:
@@ -1295,7 +1217,7 @@ def train_step(
     """
 
     # RNG splits for context sampling and losses (including imagination).
-    rng_key, ctx_key, loss_key = jax.random.split(rng_key, 3)
+    rng, ctx_key, loss_key = jax.random.split(rng, 3)
 
     # ----- Context sampling -----
     context_frames, context_actions, _ = sample_contexts(
@@ -1303,14 +1225,14 @@ def train_step(
         actions_full,
         rewards_full,
         ctx_key,
-        context_length,
+        cfg.context_length,
         videos.shape[2],
         videos.shape[3],
         videos.shape[4],
     )
 
     # ----- Encode context frames to latents -----
-    context_patches = temporal_patchify(context_frames, patch)
+    context_patches = temporal_patchify(context_frames, cfg.tokenizer.patch)
     z_btLd, _ = encoder.apply(
         enc_vars,
         context_patches,
@@ -1320,7 +1242,7 @@ def train_step(
     z_context = pack_bottleneck_to_spatial(
         z_btLd,
         n_spatial=n_spatial,
-        k=packing_factor,
+        k=cfg.dynamics.packing_factor,
     )  # (B, context_length, n_spatial, d_spatial)
 
     def loss_fn(p):
@@ -1336,7 +1258,7 @@ def train_step(
         rng_rew, rng_val, rng_pi, rng_imag = jax.random.split(loss_key, 4)
 
         # ----- Imagination rollout in latent space (depends on policy params) -----
-        def policy_fn(h: jnp.ndarray, rng: jax.Array, state: Any):
+        def policy_fn(h: Float[Array, "B d_model"], rng: Array, state: Any):
             # h: (B, d_model) – treat as constant feature for the policy
             h_sg = jax.lax.stop_gradient(h)
             rng_act, rng_drop = jax.random.split(rng)
@@ -1364,7 +1286,7 @@ def train_step(
                 z_context=z_context,
                 context_actions=context_actions,
                 task_ids=task_ids,
-                horizon=horizon,
+                horizon=cfg.horizon,
                 policy_fn=policy_fn,
                 policy_state=None,
                 rng_key=rng_imag,
@@ -1410,7 +1332,7 @@ def train_step(
         def step(carry, inputs):
             G_next = carry
             r_t1, v_t1 = inputs
-            G_t = r_t1 + gamma * ((1 - lambda_) * v_t1 + lambda_ * G_next)
+            G_t = r_t1 + cfg.gamma * ((1 - cfg.lambda_) * v_t1 + cfg.lambda_ * G_next)
             return G_t, G_t
 
         r_rev = rewards[:, ::-1]  # (B, T): r_T...r_1
@@ -1463,7 +1385,7 @@ def train_step(
         # Negative set: encourage high log-prob
         loss_negative = jnp.where(
             n_negative > 0,
-            (1 - alpha)
+            (1 - cfg.alpha)
             * jnp.sum(jnp.where(mask_negative, logp_flat, 0.0))
             / n_negative,
             0.0,
@@ -1472,7 +1394,7 @@ def train_step(
         # Positive set: discourage high log-prob
         loss_positive = jnp.where(
             n_positive > 0,
-            -alpha
+            -cfg.alpha
             * jnp.sum(jnp.where(mask_positive, logp_flat, 0.0))
             / n_positive,
             0.0,
@@ -1481,7 +1403,7 @@ def train_step(
         # KL(π_θ || π_BC) regularization
         pi_bc_logits = policy_head_bc.apply(
             pi_bc_vars,
-            imagined_hidden_states[:, :horizon, :],
+            imagined_hidden_states[:, :cfg.horizon, :],
             deterministic=True,
         )  # (B, horizon, L, A)
         pi_bc_logits_t0 = pi_bc_logits[:, :, 0, :]  # (B, horizon, A)
@@ -1492,7 +1414,7 @@ def train_step(
             p_pi * (logp_pi - logp_bc),
             axis=-1,
         )  # (B, horizon)
-        kl_loss = beta * jnp.mean(kl_per_state)
+        kl_loss = cfg.beta * jnp.mean(kl_per_state)
 
         pi_loss = loss_negative + loss_positive + kl_loss
         total_loss = val_loss + pi_loss
@@ -1524,7 +1446,7 @@ def train_step(
     new_val_vars = {**val_vars, "params": new_params["val"]}
     new_pi_vars = {**pi_vars, "params": new_params["pi"]}
 
-    return new_params, new_opt_state, new_val_vars, new_pi_vars, aux, rng_key
+    return new_params, new_opt_state, new_val_vars, new_pi_vars, aux, rng
 
 
 # ---------------------------
@@ -1532,64 +1454,69 @@ def train_step(
 # ---------------------------
 
 
+@pyrallis.wrap()
 def run(cfg: RLConfig):
+    pprint.pprint(asdict(cfg))
+
+    date = datetime.now().strftime("%m%d-%H%M")
+    run_name = f"{cfg.run_name}_seed{cfg.seed}_{date}"
     # Initialize wandb if enabled
-    if cfg.use_wandb:
-        if not WANDB_AVAILABLE:
-            print(
-                "[warning] wandb requested but not installed. "
-                "Install with: pip install wandb"
-            )
-            print("[warning] Continuing without wandb logging.")
-        else:
-            wandb_project = cfg.wandb_project or cfg.run_name
-            wandb.init(
-                entity=cfg.wandb_entity,
-                project=wandb_project,
-                name=cfg.run_name,
-                config=asdict(cfg),
-                dir=str(Path(cfg.log_dir).resolve()),
-            )
-            print(
-                f"[wandb] Initialized run: "
-                f"{wandb.run.name if wandb.run else 'N/A'}"
-            )
+    if cfg.use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            entity=cfg.wandb_entity,
+            project=cfg.wandb_project,
+            name=run_name,
+            group=cfg.wandb_group or cfg.run_name,
+            config=asdict(cfg),
+            dir=str(Path(cfg.log_dir).resolve()),
+        )
+        print(f"[wandb] Initialized run: {wandb.run.name if wandb.run else 'N/A'}")
+    else:
+        print("[warning] wandb not installed. Install with: pip install wandb")
+        print("[warning] Continuing without wandb logging.")
 
     # Output dirs
     root = _ensure_dir(Path(cfg.log_dir))
-    run_dir = _ensure_dir(root / cfg.run_name)
+    run_dir = _ensure_dir(root / run_name)
     ckpt_dir = _ensure_dir(run_dir / "checkpoints")
     vis_dir = _ensure_dir(run_dir / "viz")
     print(f"[setup] writing artifacts to: {run_dir.resolve()}")
 
+    rng = jax.random.PRNGKey(cfg.seed)
+
     # Data iterator
-    next_batch = make_iterator(
-        cfg.B,
-        cfg.T,
-        cfg.H,
-        cfg.W,
-        cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        hold_min=cfg.hold_min,
-        hold_max=cfg.hold_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
+    if cfg.env.env_type == "TinyEnv":
+        next_batch = make_iterator(
+            cfg.env.B,
+            cfg.env.T,
+            cfg.env.H,
+            cfg.env.W,
+            cfg.env.C,
+            pixels_per_step=cfg.env.pixels_per_step,
+            size_min=cfg.env.size_min,
+            size_max=cfg.env.size_max,
+            hold_min=cfg.env.hold_min,
+            hold_max=cfg.env.hold_max,
+            fg_min_color=0 if cfg.env.diversify_data else 128,
+            fg_max_color=255 if cfg.env.diversify_data else 128,
+            bg_min_color=0 if cfg.env.diversify_data else 255,
+            bg_max_color=255 if cfg.env.diversify_data else 255,
+        )
+    elif cfg.env.env_type == "Atari":
+        raise NotImplementedError("not implemented yet")
+    else:
+        raise ValueError(f"Unknown env type: {cfg.env.env_type}")
 
     # Initialize models and load checkpoints
-    init_rng = jax.random.PRNGKey(0)
-    _, (frames_init, actions_init, rewards_init) = next_batch(init_rng)
+    rng, (frames_init, actions_init, rewards_init) = next_batch(rng)
     del rewards_init
 
-    train_state = initialize_models(cfg, frames_init, actions_init)
+    rng, init_rng = jax.random.split(rng)
+    train_state = initialize_models(cfg, init_rng, frames_init, actions_init)
 
-    patch = cfg.patch
+    patch = cfg.tokenizer.patch
     k_max = cfg.k_max
-    n_spatial = cfg.enc_n_latents // cfg.packing_factor
+    n_spatial = cfg.tokenizer.enc_n_latents // cfg.dynamics.packing_factor
 
     # Imagination schedule (static)
     imag_cfg = ImaginationConfig(
@@ -1605,24 +1532,30 @@ def run(cfg: RLConfig):
     schedule = _build_static_schedule(imag_cfg)
 
     # Real-environment evaluation env fns.
-    env_reset_fn = make_env_reset_fn(
-        batch_size=cfg.eval_batch_size,
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
-        pixels_per_step=cfg.pixels_per_step,
-        size_min=cfg.size_min,
-        size_max=cfg.size_max,
-        fg_min_color=0 if cfg.diversify_data else 128,
-        fg_max_color=255 if cfg.diversify_data else 128,
-        bg_min_color=0 if cfg.diversify_data else 255,
-        bg_max_color=255 if cfg.diversify_data else 255,
-    )
-    env_step_fn = make_env_step_fn(
-        height=cfg.H,
-        width=cfg.W,
-        channels=cfg.C,
-    )
+    if cfg.env.env_type == "TinyEnv":
+        env_reset_fn = make_env_reset_fn(
+            batch_size=cfg.eval_batch_size,
+            height=cfg.env.H,
+            width=cfg.env.W,
+            channels=cfg.env.C,
+            pixels_per_step=cfg.env.pixels_per_step,
+            size_min=cfg.env.size_min,
+            size_max=cfg.env.size_max,
+            fg_min_color=0 if cfg.env.diversify_data else 128,
+            fg_max_color=255 if cfg.env.diversify_data else 128,
+            bg_min_color=0 if cfg.env.diversify_data else 255,
+            bg_max_color=255 if cfg.env.diversify_data else 255,
+        )
+        env_step_fn = make_env_step_fn(
+            height=cfg.env.H,
+            width=cfg.env.W,
+            channels=cfg.env.C,
+        )
+    elif cfg.env.env_type == "Atari":
+        env_reset_fn = None
+        env_step_fn = None
+    else:
+        raise ValueError(f"Unknown env type: {cfg.env.env_type}")
 
     # Checkpoint manager and optional restore
     mngr = make_manager(
@@ -1634,19 +1567,21 @@ def run(cfg: RLConfig):
         enc_kwargs=train_state.enc_kwargs,
         dec_kwargs=train_state.dec_kwargs,
         dynamics_kwargs=train_state.dyn_kwargs,
-        H=cfg.H,
-        W=cfg.W,
-        C=cfg.C,
+        H=cfg.env.H,
+        W=cfg.env.W,
+        C=cfg.env.C,
         patch=patch,
         k_max=k_max,
-        packing_factor=cfg.packing_factor,
+        packing_factor=cfg.dynamics.packing_factor,
         n_spatial=n_spatial,
         bc_rew_ckpt_dir=cfg.bc_rew_ckpt,
         cfg=asdict(cfg),
     )
 
-    rng = jax.random.PRNGKey(0)
-    state_example = make_state(train_state.params, train_state.opt_state, rng, step=0)
+    rng, state_rng = jax.random.split(rng)
+    state_example = make_state(
+        train_state.params, train_state.opt_state, state_rng, step=0
+    )
     restored = try_restore(mngr, state_example, meta)
 
     start_step = 0
@@ -1667,21 +1602,16 @@ def run(cfg: RLConfig):
         print(f"[restore] Resumed from {ckpt_dir} at step={latest_step}")
 
     # Training loop
-    train_rng = jax.random.PRNGKey(2025)
-    data_rng = jax.random.PRNGKey(12345)
-    eval_rng = jax.random.PRNGKey(98765)
-
     start_wall = time.time()
     for step in range(start_step, cfg.max_steps + 1):
         # Sample batch
-        data_rng, batch_key = jax.random.split(data_rng)
-        _, (videos, actions_full, rewards_full) = next_batch(batch_key)
+        rng, (videos, actions_full, rewards_full) = next_batch(rng)
 
         # Task IDs (currently dummy zeros)
-        task_ids = jnp.zeros((cfg.B,), dtype=jnp.int32)
+        task_ids = jnp.zeros((cfg.env.B,), dtype=jnp.int32)
 
         # JITted train step
-        train_rng, step_key = jax.random.split(train_rng)
+        rng, step_rng = jax.random.split(rng)
         train_step_start = time.time()
         (
             new_params,
@@ -1691,6 +1621,7 @@ def run(cfg: RLConfig):
             aux,
             train_rng,
         ) = train_step(
+            cfg=cfg,
             encoder=train_state.encoder,
             dynamics=train_state.dynamics,
             task_embedder=train_state.task_embedder,
@@ -1714,16 +1645,8 @@ def run(cfg: RLConfig):
             actions_full=actions_full,
             rewards_full=rewards_full,
             task_ids=task_ids,
-            horizon=cfg.horizon,
-            gamma=cfg.gamma,
-            lambda_=cfg.lambda_,
-            alpha=cfg.alpha,
-            beta=cfg.beta,
-            context_length=cfg.context_length,
-            patch=patch,
             n_spatial=n_spatial,
-            packing_factor=cfg.packing_factor,
-            rng_key=step_key,
+            rng=step_rng,
         )
         train_step_end = time.time()
         train_state.params = new_params
@@ -1733,6 +1656,7 @@ def run(cfg: RLConfig):
 
         # Periodically evaluate the policy in the real environment.
         if cfg.eval_every > 0 and (step % cfg.eval_every == 0):
+            rng, eval_rng = jax.random.split(train_rng)
             metrics_eval, media_eval, eval_rng = evaluate_policy_real_env(
                 train_state,
                 cfg,
@@ -1871,28 +1795,4 @@ def run(cfg: RLConfig):
 
 
 if __name__ == "__main__":
-    cfg = RLConfig(
-        run_name="train_policy_jit_flippedrew2_test",
-        bc_rew_ckpt="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs/train_bc_rew_flippedrew/checkpoints",
-        use_wandb=False,
-        wandb_entity="edhu",
-        wandb_project="tiny_dreamer_4",
-        log_dir="/vast/projects/dineshj/lab/hued/tiny_dreamer_4/logs",
-        max_steps=100_000,
-        log_every=100,
-        lr=1e-4,
-        ckpt_save_every=100_000,
-        ckpt_max_to_keep=2,
-        write_video_every=1,
-        visualize_every=1,
-        eval_every=5000,
-        eval_episodes=64,
-        eval_horizon=32,
-        eval_batch_size=64,
-        gamma=0.9,
-    )
-    print(
-        "Running RL config:\n  "
-        + "\n  ".join([f"{k}={v}" for k, v in asdict(cfg).items()])
-    )
-    run(cfg)
+    run()

@@ -2,6 +2,7 @@ from dataclasses import dataclass, asdict
 from functools import partial
 from typing import Optional
 import time
+from datetime import datetime
 from pathlib import Path
 import pprint
 import jax
@@ -230,13 +231,15 @@ def train_step(
 def run(cfg: TokenizerConfig):
     pprint.pprint(cfg)
 
+    date = datetime.now().strftime('%m%d-%H%M')
+    run_name = f"{cfg.run_name}_seed{cfg.seed}_{date}"
     # wandb init
     if cfg.use_wandb:
         wandb.init(
             entity=cfg.wandb_entity,
             config=asdict(cfg),
             project=cfg.wandb_project,
-            name=cfg.run_name,
+            name=run_name,
             group=cfg.wandb_group or cfg.run_name,
             dir=str(Path(cfg.log_dir).resolve()),
         )
@@ -244,7 +247,7 @@ def run(cfg: TokenizerConfig):
 
     log_dir = Path(cfg.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    run_dir = log_dir / cfg.run_name
+    run_dir = log_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     rng = jax.random.PRNGKey(cfg.seed)
